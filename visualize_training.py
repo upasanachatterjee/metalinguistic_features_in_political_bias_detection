@@ -76,14 +76,15 @@ def create_task_averages_plot(df, save_path=None):
     cmap = plt.colormaps.get_cmap('tab10')  # Good for up to 10 distinct colors
     colors = [cmap(i / max(1, len(task_names) - 1)) for i in range(len(task_names))]
     
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12))
+    fig, ax1 = plt.subplots(1, 1, figsize=(16, 12))
     
     # Plot 1: Task averages over steps
     for i, task_name in enumerate(task_names):
         col_name = f'{task_name}_avg'
         if col_name in df.columns:
-            ax1.plot(df['step'], df[col_name], 
-                    label=f'{task_name.title()} Loss', 
+            smoothed = df[col_name].rolling(window=10, min_periods=1).mean()
+            ax1.plot(df['step'], smoothed, 
+                    label=f'{task_name.title()} Loss (Smoothed)', 
                     color=colors[i], linewidth=2)
     
     ax1.set_xlabel('Training Step')
@@ -91,31 +92,7 @@ def create_task_averages_plot(df, save_path=None):
     ax1.set_title('Task Averages Over Training Steps')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: Task averages with learning rate overlay
-    ax2_lr = ax2.twinx()
-    
-    for i, task_name in enumerate(task_names):
-        col_name = f'{task_name}_avg'
-        if col_name in df.columns:
-            ax2.plot(df['step'], df[col_name], 
-                    label=f'{task_name.title()} Loss', 
-                    color=colors[i], linewidth=2)
-    
-    ax2_lr.plot(df['step'], df['learning_rate'], label='Learning Rate', color='green', 
-                linestyle='--', alpha=0.7)
-    
-    ax2.set_xlabel('Training Step')
-    ax2.set_ylabel('Task Average Loss', color='black')
-    ax2_lr.set_ylabel('Learning Rate', color='green')
-    ax2.set_title('Task Averages with Learning Rate Schedule')
-    
-    # Combine legends
-    lines1, labels1 = ax2.get_legend_handles_labels()
-    lines2, labels2 = ax2_lr.get_legend_handles_labels()
-    ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
-    ax2.grid(True, alpha=0.3)
-    
+    ax1.set_yscale('log')
     plt.tight_layout()
     
     if save_path:

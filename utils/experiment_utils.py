@@ -13,7 +13,7 @@ from .trainer_utils import (
     CustomTrainer,
     create_loss_function,
 )
-from ..model import BiasClassifier
+from ..model import MultiTaskRoberta
 
 from datasets import DatasetDict
 from transformers import TrainingArguments, Trainer, EarlyStoppingCallback
@@ -21,6 +21,7 @@ from typing import Dict, Optional
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
+import torch.nn as nn
 
 
 BERT = "google-bert/bert-base-uncased"
@@ -98,25 +99,41 @@ def load_model(model):
         model = AutoModelForSequenceClassification.from_pretrained(model, num_labels=3)
         return tokenizer, model
     else:
-        print(f"Attempting to load as BiasClassifier...")
+        print(f"Attempting to load as MultiTaskRoberta...")
         try:
-            classification_model = BiasClassifier.from_pretrained_checkpoint(
-            model, 
-            num_bias_classes=3, 
-            freeze_backbone=True
-        )
-                        
+            checkpoint = torch.load(model, map_location="cpu")
+            classification_model = MultiTaskRoberta(theme_path="top_themes.txt")  # Initialize with same config
+            classification_model.load_state_dict(checkpoint["model_state_dict"])
+
+            num_classes = 3  # For bias classification
+            classification_model.theme_head = nn.Linear(classification_model.backbone.config.hidden_size, num_classes)
+            
+            def new_forward(input_ids=None, attention_mask=None, labels=None, **kwargs):
+                    return {
+                        "loss": nn.CrossEntropyLoss()(classification_model.theme_head(
+                            classification_model.pool(classification_model.backbone(
+                                input_ids, attention_mask).last_hidden_state, attention_mask)
+                        ), labels) if labels is not None else None,
+                        "logits": classification_model.theme_head(
+                            classification_model.pool(classification_model.backbone(
+                                input_ids, attention_mask).last_hidden_state, attention_mask)
+                        )
+                    }
+            
+            # Patch the forward method
+            classification_model.forward = new_forward
+
             # Get the tokenizer from the base model name
             tokenizer = AutoTokenizer.from_pretrained("roberta-base")
             
-            print(f"Successfully loaded BiasClassifier from {model}")
+            print(f"Successfully loaded MultiTaskRoberta from {model}")
             print(f"Using tokenizer from roberta-base")
             
             return tokenizer, classification_model
             
         except Exception as e:
-            print(f"Failed to load as BiasClassifier: {e}")
-            print("Falling back to legacy custom loading...")
+            print(f"Failed to load as MultiTaskRoberta: {e}")
+            print("Falling back to roberta-base...")
             
             # Fallback to original custom loading logic
             state = torch.load(f"{model}/pytorch_model.bin", map_location="cpu")
@@ -345,6 +362,7 @@ def make_training_args(
         adam_beta1=0.9,
         adam_beta2=0.999,
         warmup_ratio=0.06,
+        save_safetensors=False
     )
 
 def ensure_validation_dataset(test_ds, val_ds):

@@ -26,7 +26,6 @@ class TaskSpec:
 class TrainArgs:
     # pretraining args
     model_name: str = "roberta-base"
-    output_dir: str = "./mtl_ckpt"
     num_epochs: int = 3  # Number of epochs to train for
     warmup_ratio: float = 0.1
     batch_size: int = 8 

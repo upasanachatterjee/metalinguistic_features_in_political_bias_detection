@@ -35,6 +35,29 @@ class MultiTaskRoberta(nn.Module):
         # Clean up the temporary model
         del mlm_model
 
+     # Add these methods to support gradient checkpointing
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable gradient checkpointing for the backbone model"""
+        if hasattr(self.backbone, "gradient_checkpointing_enable"):
+            self.backbone.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+            )
+        else:
+            # Fallback for older transformers versions
+            self.backbone.config.use_cache = False
+            self.backbone.gradient_checkpointing = True
+        return self
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for the backbone model"""
+        if hasattr(self.backbone, "gradient_checkpointing_disable"):
+            self.backbone.gradient_checkpointing_disable()
+        else:
+            # Fallback for older transformers versions
+            self.backbone.config.use_cache = True
+            self.backbone.gradient_checkpointing = False
+        return self
+
     def forward(self, input_ids=None, attention_mask=None, mlm=False, labels=None, **kwargs):
         # Clone inputs to prevent in-place modifications affecting autograd
         if input_ids is not None:
@@ -73,6 +96,29 @@ class MultiTaskRoberta(nn.Module):
             pooled = self.pool(backbone_output.last_hidden_state, attention_mask)
             z = F.normalize(self.proj(pooled), p=2, dim=-1)
             return z, pooled  # z for triplet, pooled for themes/tone
+
+    # Add this method to your MultiTaskRoberta class or create a subclass
+    def forward_classification(self, input_ids, attention_mask=None, labels=None):
+        # Get the pooled representation
+        _, pooled = super().forward(input_ids, attention_mask)
+        
+        # Use either the existing theme_head or a new bias_head
+        # Option 1: Using theme_head (if repurposed)
+        logits = self.theme_head(pooled)
+        
+        # Option 2: Using a new bias_head (if added)
+        # logits = self.bias_head(pooled)
+        
+        loss = None
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(logits, labels)
+        
+        # Return in the format expected by Trainer
+        return {
+            "loss": loss,
+            "logits": logits,
+        }
 
     def save_checkpoint(self, path):
         """Save model checkpoint with config info"""

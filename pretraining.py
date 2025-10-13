@@ -17,7 +17,7 @@ os.makedirs(output_dir, exist_ok=True)
 
 # --- Training prep ---
 accelerator = Accelerator(
-    mixed_precision="fp16", gradient_accumulation_steps=8, project_dir="./mtl_ckpt"
+    mixed_precision="fp16", gradient_accumulation_steps=8, project_dir=output_dir
 )
 
 args = TrainArgs()
@@ -449,7 +449,7 @@ while epoch < args.num_epochs:
 
     # Save checkpoint at end of epoch
     if accelerator.is_main_process:
-        epoch_checkpoint_path = f"{args.output_dir}/epoch-{epoch + 1}"
+        epoch_checkpoint_path = f"{output_dir}/epoch-{epoch + 1}"
         print(f"Saving epoch checkpoint to {epoch_checkpoint_path}...")
         model.save_checkpoint(f"{epoch_checkpoint_path}.pt")
         print(f"Epoch checkpoint saved")
@@ -482,7 +482,7 @@ print("Accelerator shutdown complete")
 
 # Save final model
 if accelerator.is_main_process:
-    final_model_path = f"{args.output_dir}/final_model"
+    final_model_path = f"{output_dir}/final_model"
     print(f"Saving final model to {final_model_path}...")
     model.save_checkpoint(f"{final_model_path}.pt")
     print(f"Final model saved")
@@ -494,5 +494,5 @@ print(f"   - Total epochs completed: {args.num_epochs}")
 print(f"   - Total steps executed: {step:,}")
 print(f"   - Max steps per epoch: {max_steps_per_epoch:,}")
 print(f"   - Tasks trained: {', '.join(available_tasks)}")
-print(f"   - Final model saved to: {args.output_dir}/final_model")
+print(f"   - Final model saved to: {output_dir}/final_model")
 print("=" * 80)
