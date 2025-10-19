@@ -12,7 +12,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Avoid tokenizer warnings
 
 # Create output directories
-output_dir = "./mtl_ckpt"
+output_dir = "./themes_1000_mtl_ckpt"
 os.makedirs(output_dir, exist_ok=True)
 
 # --- Training prep ---
@@ -39,13 +39,10 @@ print(f"TrainArgs loaded: {args.num_epochs} epochs, {args.model_name}")
 # Check if themes file exists
 import os
 
-themes_path = "top_themes.txt"
-theme_count = 0
+theme_count = 1000  # Default value
+tone_count = 2  # Default value
 
-with open(themes_path, "r") as f:
-    theme_count = len(f.readlines())
-
-model = MultiTaskRoberta(theme_path=themes_path)
+model = MultiTaskRoberta(num_themes=theme_count, num_tones=tone_count)
 model.to(accelerator.device)
 print(f"Model initialized: {model.__class__.__name__}")
 
@@ -190,7 +187,7 @@ if "themes" in available_tasks:
 
 ## manually setting order for testing
 order = ["no more round robin -- using all tasks every step"]
-available_tasks = ["triplet", "mlm"]
+available_tasks = ["triplet", "mlm", "themes"]
 
 for task, label in zip(
     ["triplet", "mlm", "themes", "tone"], ["triplet", "mlm", "multilabel", "regression"]
@@ -220,6 +217,7 @@ with open(log_file, "w") as f:
     f.write(f"GPUs: {accelerator.num_processes}\n")
     f.write(f"Order: {order}\n")
     f.write(f"Available Tasks: {available_tasks}\n")
+    f.write(f"Using num themes: {theme_count} and num tones: {tone_count}\n")
     f.write("=" * 50 + "\n\n")
 print(f"   Logging initialized: {log_file}")
 

@@ -12,7 +12,7 @@ class MeanPooler(nn.Module):
 
 
 class MultiTaskRoberta(nn.Module):
-    def __init__(self, name="roberta-base", emb_dim=256, theme_path="top_themes.txt"):
+    def __init__(self, name="roberta-base", emb_dim=256, num_tones=2, num_themes=1000):
         super().__init__()
         # Single backbone model
         self.backbone = AutoModel.from_pretrained(name)
@@ -21,12 +21,9 @@ class MultiTaskRoberta(nn.Module):
 
         # Task-specific heads
         self.proj = nn.Sequential(nn.Linear(hid, emb_dim), nn.GELU())
-        num_themes = 0
 
-        with open(theme_path) as f:
-            num_themes = len(f.readlines())
         self.theme_head = nn.Linear(hid, num_themes)
-        self.tone_head = nn.Linear(hid, 2)
+        self.tone_head = nn.Linear(hid, num_tones)
 
         # MLM head - create just the head, not the full model
         # Load the full MLM model temporarily to get the LM head
