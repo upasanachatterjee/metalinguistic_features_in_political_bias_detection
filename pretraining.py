@@ -229,6 +229,9 @@ model.train()
 # Loss tracking
 loss_accumulator = {"triplet": [], "mlm": [], "tone": [], "themes": []}
 
+# Missing samples tracking
+missing_samples = {"triplet": 0, "mlm": 0, "tone": 0, "themes": 0}
+
 print(f"\n Loss tracking initialized for {len(loss_accumulator)} tasks")
 
 
@@ -282,6 +285,7 @@ while epoch < args.num_epochs:
                     print(
                         f"   Skipping triplet step {step} - no valid triplets found, using dummy loss"
                     )
+                    missing_samples["triplet"] += 1
                     loss_tlp = torch.tensor(0.0, device=accelerator.device)
                 else:
                     za, _ = model(
@@ -310,6 +314,7 @@ while epoch < args.num_epochs:
                         f"     Skipping themes step {step} - no valid samples, using dummy loss"
                     )
                     loss_themes = torch.tensor(0.0, device=accelerator.device)
+                    missing_samples["themes"] += 1
                 else:
                     z, pooled = model(b["input_ids"], b["attention_mask"])
                     logits = model.theme_head(pooled)
@@ -327,12 +332,14 @@ while epoch < args.num_epochs:
                         f"     Skipping tone step {step} - no valid samples, using dummy loss"
                     )
                     loss_tone = torch.tensor(0.0, device=accelerator.device)
+                    missing_samples["tone"] += 1
                 else:
                     z, pooled = model(b["input_ids"], b["attention_mask"])
                     pred = model.tone_head(pooled)
                     loss_tone = mse_loss(pred, b["targets"].float())
                     if loss_tone is not None:
                         loss_accumulator["tone"].append(loss_tone.item())
+        
 
                 loss = update_loss(loss_tone, loss)
 
@@ -432,6 +439,7 @@ while epoch < args.num_epochs:
                     f.write(
                         f"  Epoch: {epoch + 1} ({epoch_progress_pct:.1f}%), Epoch ETC: {epoch_eta_str}\n"
                     )
+                    f.write(f"  Missing Samples (as percentage of steps in current epoch): tlp={missing_samples['triplet'] / steps_in_current_epoch * 100:.1f}%, mlm={missing_samples['mlm'] / steps_in_current_epoch * 100:.1f}%, tone={missing_samples['tone'] / steps_in_current_epoch * 100:.1f}%, themes={missing_samples['themes'] / steps_in_current_epoch * 100:.1f}%\n")
                     if task_losses:
                         f.write(f"  Task Averages: {task_losses}\n")
                     f.write("\n")

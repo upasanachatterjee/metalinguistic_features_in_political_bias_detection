@@ -101,8 +101,12 @@ def load_model(model):
     else:
         print(f"Attempting to load as MultiTaskRoberta...")
         try:
+            themes = 1000 if "1000" in model else 2000
+            tones = 1 if "tone_tone" in model else 2
+            print(f"loading w num_themes={themes}, num_tones={tones}")
+
             checkpoint = torch.load(model, map_location="cpu")
-            classification_model = MultiTaskRoberta(theme_path="top_themes.txt")  # Initialize with same config
+            classification_model = MultiTaskRoberta(num_tones=tones, num_themes=themes)  # Initialize with same config
             classification_model.load_state_dict(checkpoint["model_state_dict"])
 
             num_classes = 3  # For bias classification
@@ -362,7 +366,8 @@ def make_training_args(
         adam_beta1=0.9,
         adam_beta2=0.999,
         warmup_ratio=0.06,
-        save_safetensors=False
+        save_safetensors=False,
+        seed=42
     )
 
 def ensure_validation_dataset(test_ds, val_ds):
