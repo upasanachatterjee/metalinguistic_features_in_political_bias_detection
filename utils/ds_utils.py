@@ -5,13 +5,13 @@ from collections import Counter
 from nltk.tokenize import sent_tokenize
 from typing import Dict, List, Any
 from transformers import PreTrainedTokenizerBase
-from datasets import Dataset, load_dataset
-from huggingface_hub import login
+from datasets import Dataset
 import re
 import unicodedata
 import json
 
 from dotenv import load_dotenv
+from transformers import set_seed
 
 UNK = None
 SEP = None
@@ -22,7 +22,9 @@ nltk.download("punkt", quiet=True)
 nltk.download("punkt_tab", quiet=True)
 
 
+set_seed(42)
 load_dotenv()
+
 
 def sanitize_for_literal_eval(text: str) -> str:
     """
@@ -66,7 +68,7 @@ def undersample_per_topic(dataset: Dataset) -> Dataset:
     Returns a new Dataset containing an equal number of samples per int_bias class
     within each topic.
     """
-     # Convert columns to numpy arrays once for speed
+    # Convert columns to numpy arrays once for speed
     topics = np.array(dataset["topic"])
     labels = np.array(dataset["int_bias"])
     all_indices = []
@@ -519,9 +521,12 @@ def clean_dataset_optimized(
 
     # ---- 5) Class‐encode labels, rename to "label", select only needed columns ----
     # chunked = chunked.class_encode_column("int_bias")  # now int_bias → class IDs
-    chunked = chunked.rename_column("int_bias", "label")
-    chunked = chunked.select_columns(["label", "text", "id"])
 
+    chunked = chunked.rename_column("int_bias", "bias_labels")
+    chunked = chunked.select_columns(["bias_labels", "text", "id"])
+
+    # chunked = chunked.rename_column("int_bias", "labels")
+    # chunked = chunked.select_columns(["labels", "text", "id"])
     # ---- 6) Tokenize all final chunks (batched) ----
     def tokenize_batch(exs: Dict[str, List[Any]]) -> Dict[str, Any]:
         return tokenizer(
@@ -534,4 +539,7 @@ def clean_dataset_optimized(
         remove_columns=["text"],  # no longer need raw text after tokenization
         num_proc=num_proc,
     )
+    tokenized = tokenized.rename_column("input_ids", "bias_input_ids")
+    tokenized = tokenized.rename_column("attention_mask", "bias_attention_mask")
+
     return tokenized

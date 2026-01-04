@@ -1,8 +1,6 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import torch
-from datasets import load_dataset, Dataset
-import os
 from huggingface_hub import login
 import time
 from datetime import datetime, timedelta
@@ -23,15 +21,16 @@ class TaskSpec:
     # Regression
     regression_col: Optional[str] = "V2Tone"  # column containing float target(s)
     tones_count: int = 2
+    max_triplet_samples: int = 16
 
 
 @dataclass
 class TrainArgs:
     # pretraining args
     model_name: str = "roberta-base"
-    num_epochs: int = 2  # Number of epochs to train for
-    warmup_ratio: float = 0.1
-    batch_size: int = 8 
+    num_epochs: int = 3  # Number of epochs to train for
+    warmup_ratio: float = 0.06
+    batch_size: int = 32
     log_every: int = 5000
     # dataloader args
     dataloader_num_workers: int = 4  # More workers for high-throughput GPUs
