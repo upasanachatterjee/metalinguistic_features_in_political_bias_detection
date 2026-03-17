@@ -5,7 +5,7 @@ from sklearn.metrics import (
     recall_score,
     precision_recall_fscore_support,
 )
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from transformers import Trainer
 from datasets import Dataset
 import numpy as np
@@ -14,56 +14,29 @@ import torch.nn.functional as F
 
 
 class CustomTrainer(Trainer):
-    """Custom Trainer that supports different loss functions."""
-
-    def __init__(self, loss_fn: Optional[torch.nn.Module] = None, **kwargs):
-        super().__init__(**kwargs)
-        self.loss_fn = loss_fn
-
     def compute_loss(self, model, inputs, return_outputs=False):
-        """Override compute_loss to use custom loss function if provided."""
-        labels = inputs.get("bias_labels")
+        labels = inputs.get("bias_labels") or inputs.get("labels")
         outputs = model(**inputs)
-        logits = outputs.get("bias_logits")
-        loss = outputs.get("bias_loss")
-
-        # if not labels:
-        #     labels = inputs.get("labels")
-        #     outputs = model(**inputs)
-        #     logits = outputs.get("logits")
-        #     loss = outputs.get("loss")
-
-        # Only compute custom loss if not already computed by model
-        if loss is None and self.loss_fn is not None:
-            # Standard loss functions expect class indices
-            loss = self.loss_fn(logits, labels)
-        elif loss is None:
-            # Use default cross-entropy loss
+        logits = outputs.get("bias_logits") or outputs.get("logits")
+        loss = outputs.get("bias_loss") or outputs.get("loss")
+        if loss is None:
             loss = F.cross_entropy(logits, labels)
-
-        # Create outputs dict with logits for evaluation
         if not isinstance(outputs, dict):
             outputs = {"logits": logits, "loss": loss}
         elif "logits" not in outputs:
             outputs["logits"] = logits
-
         return (loss, outputs) if return_outputs else loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        labels = inputs.get("bias_labels")
-        # if not labels:
-        #     labels = inputs.get("labels")
+        labels = inputs.get("bias_labels") or inputs.get("labels")
 
         with torch.no_grad():
             outputs = model(**inputs)
 
             # Extract bias-specific outputs
             if isinstance(outputs, dict):
-                loss = outputs.get("bias_loss")
-                logits = outputs.get("bias_logits")
-                # if not loss:
-                #     loss = outputs.get("loss")
-                #     logits = outputs.get("logits")
+                loss = outputs.get("bias_loss") or outputs.get("loss")
+                logits = outputs.get("bias_logits") or outputs.get("logits")
             else:
                 loss = outputs.loss if hasattr(outputs, "loss") else None
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs

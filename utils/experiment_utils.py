@@ -1,10 +1,7 @@
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-    AutoConfig,
-    set_seed,
-)
-from .ds_utils import clean_dataset_optimized, load_dataset
+from transformers import set_seed
+from .ds_utils import clean_dataset_optimized
+from datasets import load_dataset
+from .model_utils import load_model, get_model_name, BERT, BART, ROBERTA, POLITICS
 
 import json
 import os
@@ -26,47 +23,26 @@ from dataclasses import dataclass
 set_seed(42)
 
 
-BERT = "google-bert/bert-base-uncased"
-BART = "facebook/bart-base"
-BART_LARGE = "facebook/bart-large"
-ROBERTA = "FacebookAI/roberta-base"
-POLITICS = "launch/POLITICS"
-
-
 @dataclass
 class ExperimentConfig:
-    loss_type: str = "standard"
-    focal_alpha: float = 1.0
-    focal_gamma: float = 2.0
-    gamma_pos: float = 1.0
-    gamma_neg: float = 4.0
-    patience: int = 3
+    patience: int = 5
     num_epochs: int = 15
     save_model: bool = False
 
 
 @dataclass
 class DatasetConfig:
-    theme: Optional[str] = None
-    k_means: Optional[dict] = None
-    trunc: bool = False
     sentiment: bool = False
     no_undersampling: bool = False
     custom_dataset: Optional[str] = None
 
 
-MODEL_CONFIGS = {
-    "default": {
-        "batch_size": 64,
-        "grad_accumulation": 32,
-        "num_workers": 8,
-        "eval_batch_size": 64,
-    }
-}
-
-
-def get_model_config(model_name: str) -> dict:
-    return MODEL_CONFIGS["default"]
+ALLSIDES_EXTENDED_MEDIA_SPLIT = "dragonslayer631/article-bias-prediction-media-splits-updated"
+ALLSIDES_EXTENDED_RANDOM_SPLIT = "dragonslayer631/allsides_random_split_extended"
+_BATCH_SIZE = 64
+_GRAD_ACCUMULATION = 32
+_NUM_WORKERS = 8
+_EVAL_BATCH_SIZE = 64
 
 
 def remove_int_bias_1(example):
@@ -86,110 +62,42 @@ def cleanup():
         torch.cuda.empty_cache()
 
 
-def load_model(model):
-    if model in [BERT, BART, ROBERTA, POLITICS]:
-        tokenizer = AutoTokenizer.from_pretrained(model)
-        model = AutoModelForSequenceClassification.from_pretrained(model, num_labels=3)
-        return tokenizer, model
-    else:
-        print("Attempting to load as MultiTaskRoberta...")
-        try:
-            themes = 1000 if "1000" in model else 2000
-            tones = 1 if "tone_tone" in model else 2
-            print(f"loading w num_themes={themes}, num_tones={tones}")
-
-            checkpoint = torch.load(model, map_location="cpu")
-            classification_model = MultiTaskRoberta(
-                num_tones=tones, num_themes=themes, num_bias_classes=3
-            )  # Initialize with same config
-            classification_model.load_state_dict(
-                checkpoint["model_state_dict"], strict=False
-            )
-
-            # Get the tokenizer from the base model name
-            tokenizer = AutoTokenizer.from_pretrained("roberta-base")
-
-            print(f"Successfully loaded MultiTaskRoberta from {model}")
-            print("Using tokenizer from roberta-base")
-
-            return tokenizer, classification_model
-
-        except Exception as e:
-            print(f"Failed to load as MultiTaskRoberta: {e}")
-            print("Falling back to legacy custom loading...")
-
-            # Fallback to original custom loading logic
-            state = torch.load(f"{model}/pytorch_model.bin", map_location="cpu")
-            config = AutoConfig.from_pretrained("roberta-base", num_labels=3)
-            model = AutoModelForSequenceClassification.from_pretrained(
-                "roberta-base", config=config
-            )
-            model.load_state_dict(
-                state, strict=False
-            )  # strict=False tolerates head mismatches
-            tokenizer = AutoTokenizer.from_pretrained("roberta-base")
-            return tokenizer, model
-
-
-def get_model_name(model) -> str:
-    if model == BERT:
-        return "bert"
-    elif model == BART:
-        return "bart"
-    elif model == ROBERTA:
-        return "roberta"
-    elif model == POLITICS:
-        return "politics"
-    else:
-        return "custom"
-
-
 def get_cleaned_dataset(
     dataset,
     tokenizer,
-    theme,
-    grouped_topics,
-    truncate,
     sentiments,
     max_length,
     no_undersampling=False,
+    model=None,
 ):
-    # human_tests = "human_test_sentiment.csv" if sentiments else "human_test_no_sentiment.csv"
-    # validation = pd.read_csv(human_tests, sep="|")
-    # validation_dataset = Dataset.from_pandas(validation)
+    use_bias_keys = isinstance(model, MultiTaskRoberta)
 
     training_dataset = clean_dataset_optimized(
         dataset["train"],
         tokenizer=tokenizer,
-        theme=theme,
-        grouped_topics=grouped_topics,
         num_proc=24,
         sentiments=sentiments,
-        truncate=truncate,
         max_length=max_length,
-        validation=no_undersampling,
+        skip_undersampling=no_undersampling,
+        use_bias_keys=use_bias_keys,
     )
     test_dataset = clean_dataset_optimized(
         dataset["test"],
         tokenizer=tokenizer,
-        theme=theme,
-        grouped_topics=grouped_topics,
         num_proc=24,
         sentiments=sentiments,
-        truncate=truncate,
         max_length=max_length,
-        validation=True,
+        skip_undersampling=True,
+        use_bias_keys=use_bias_keys,
     )
     validation_dataset = clean_dataset_optimized(
         dataset["validation"],
         tokenizer=tokenizer,
-        theme=theme,
-        grouped_topics=grouped_topics,
         num_proc=24,
         sentiments=sentiments,
-        truncate=truncate,
         max_length=max_length,
-        validation=True,
+        skip_undersampling=True,
+        use_bias_keys=use_bias_keys,
     )
 
     return training_dataset, test_dataset, validation_dataset
@@ -238,18 +146,14 @@ def run_single(
     train, test, validation = get_cleaned_dataset(
         ds,
         tokenizer,
-        dataset_config.theme,
-        dataset_config.k_means or {},
-        dataset_config.trunc,
         dataset_config.sentiment,
         512,
         dataset_config.no_undersampling,
+        model=model,
     )
 
     # 2) train & evaluate
-    name = make_experiment_name(
-        model_name, dataset_config.theme, dataset_config.trunc, dataset_config.sentiment
-    )
+    name = make_experiment_name(model_name, None, False, dataset_config.sentiment)
     print(f"Training {name}")
     metrics_val, metrics_test = train_model(
         model, train, test, validation, f"{loc}/{name}", model_name, experiment_config
@@ -260,10 +164,34 @@ def run_single(
     metrics_val["validation_rows"] = count_unique_ids(validation, "validation")
 
     # 4) save
-    metrics_filename = f"{loc}/{experiment_config.loss_type}_{name}_test_metrics.json"
+    metrics_filename = f"{loc}/{name}_test_metrics.json"
     with open(metrics_filename, "w") as f:
         json.dump(metrics_test, f, indent=2)
     return metrics_val, metrics_test
+
+
+def _load_dataset_by_config(dataset_config: DatasetConfig) -> DatasetDict:
+    if dataset_config.custom_dataset == "make_binary":
+        ds = load_and_rename_dataset(dataset_config.sentiment)
+        for split in ["validation", "train", "test"]:
+            ds[split] = ds[split].map(make_binary)
+    elif dataset_config.custom_dataset == "remove_int_bias_1":
+        ds = load_and_rename_dataset(dataset_config.sentiment)
+        for split in ["validation", "train", "test"]:
+            ds[split] = ds[split].filter(remove_int_bias_1)
+    elif dataset_config.custom_dataset == "mediabiasgroup/BABE":
+        ds = load_dataset(dataset_config.custom_dataset)
+        ds = ds.rename_column("label", "int_bias").rename_column("uuid", "id")
+        ds["validation"] = ds["test"]
+    elif dataset_config.custom_dataset and "dragonslayer631" in dataset_config.custom_dataset:
+        ds = load_dataset(dataset_config.custom_dataset)
+        if not ds.get("validation"):
+            ds["validation"] = ds["test"]
+    else:
+        if dataset_config.custom_dataset:
+            print("unsupported action")
+        ds = load_and_rename_dataset(dataset_config.sentiment)
+    return ds
 
 
 def run_experiment(
@@ -281,62 +209,14 @@ def run_experiment(
     model_name = get_model_name(model)
     cleanup()
 
-    # load & rename dataset
     if dataset_config.custom_dataset:
         print(f"performing custom dataset action: {dataset_config.custom_dataset}")
-        if dataset_config.custom_dataset == "make_binary":
-            ds: DatasetDict = load_and_rename_dataset(
-                dataset_config.media_split, dataset_config.sentiment
-            )
-            for split in ["validation", "train", "test"]:
-                ds[split] = ds[split].map(make_binary)
-        elif dataset_config.custom_dataset == "remove_int_bias_1":
-            ds: DatasetDict = load_and_rename_dataset(
-                dataset_config.media_split, dataset_config.sentiment
-            )
-            for split in ["validation", "train", "test"]:
-                ds[split] = ds[split].filter(remove_int_bias_1)
-        elif dataset_config.custom_dataset == "mediabiasgroup/BABE":
-            ds: DatasetDict = load_dataset(dataset_config.custom_dataset)
-            ds = ds.rename_column("label", "int_bias").rename_column("uuid", "id")
-            ds["validation"] = ds["test"]
-        elif "dragonslayer631" in dataset_config.custom_dataset:
-            ds = load_dataset(dataset_config.custom_dataset)
-            if not ds.get("validation"):
-                ds["validation"] = ds["test"]
-        else:
-            print("unsupported action")
-            ds: DatasetDict = load_and_rename_dataset(
-                dataset_config.media_split, dataset_config.sentiment
-            )
-    else:
-        ds: DatasetDict = load_and_rename_dataset(
-            dataset_config.media_split, dataset_config.sentiment
-        )
-
+    ds = _load_dataset_by_config(dataset_config)
     tokenizer, model = load_model(model)
 
-    # baseline (no k-means) or iterate themes
-    if not dataset_config.k_means:
-        return run_single(
-            model_name, model, tokenizer, ds, dataset_config, loc, experiment_config
-        )
-    else:
-        results = {}
-        for theme in dataset_config.k_means:
-            theme_config = DatasetConfig(
-                theme=theme,
-                k_means=dataset_config.k_means,
-                trunc=dataset_config.trunc,
-                sentiment=dataset_config.sentiment,
-                no_undersampling=dataset_config.no_undersampling,
-                media_split=dataset_config.media_split,
-                custom_dataset=dataset_config.custom_dataset,
-            )
-            results[theme] = run_single(
-                model_name, model, tokenizer, ds, theme_config, loc, experiment_config
-            )
-        return results
+    return run_single(
+        model_name, model, tokenizer, ds, dataset_config, loc, experiment_config
+    )
 
 
 def make_training_args(
@@ -347,8 +227,6 @@ def make_training_args(
     batch_size_override: Optional[int] = None,
 ) -> TrainingArguments:
     """Create training arguments with model-specific configurations."""
-    config = get_model_config(model_name)
-
     return TrainingArguments(
         output_dir=output_dir,
         save_strategy="epoch",
@@ -358,9 +236,9 @@ def make_training_args(
         learning_rate=learning_rate,
         gradient_checkpointing=True,
         fp16=True,
-        per_device_train_batch_size=batch_size_override or config["batch_size"],
-        gradient_accumulation_steps=config["grad_accumulation"],
-        dataloader_num_workers=config["num_workers"],
+        per_device_train_batch_size=batch_size_override or _BATCH_SIZE,
+        gradient_accumulation_steps=_GRAD_ACCUMULATION,
+        dataloader_num_workers=_NUM_WORKERS,
         load_best_model_at_end=True,
         metric_for_best_model="eval_f1_macro",
         weight_decay=0.001,
@@ -393,9 +271,7 @@ def add_row_counts(metrics: dict, datasets: dict) -> None:
         metrics[f"{split_name}_rows"] = count_unique_ids(dataset, split_name)
 
 
-def training_args_to_dict(
-    training_args: TrainingArguments, patience: int, loss_type: str
-) -> dict:
+def training_args_to_dict(training_args: TrainingArguments, patience: int) -> dict:
     """Convert training arguments to dictionary with additional params."""
     return {
         key: getattr(training_args, key)
@@ -410,7 +286,7 @@ def training_args_to_dict(
             "warmup_ratio",
             "fp16",
         ]
-    } | {"patience": patience, "loss_type": loss_type}
+    } | {"patience": patience}
 
 
 def make_trainer(
@@ -420,7 +296,6 @@ def make_trainer(
     eval_ds,
     compute_fn,
     patience: int = 3,
-    **loss_kwargs,
 ) -> Trainer:
     print("patience=", patience)
     print("compute_fn=", compute_fn)
@@ -439,9 +314,8 @@ def make_trainer(
 
 def evaluate_and_cleanup(trainer: Trainer, test_ds, model_name: str):
     """Evaluate trainer and cleanup resources."""
-    config = get_model_config(model_name)
     test_metrics = batched_predict_metrics_trainer(
-        trainer, test_ds, batch_size=config["eval_batch_size"]
+        trainer, test_ds, batch_size=_EVAL_BATCH_SIZE
     )
     cleanup()  # your existing gc + torch.cuda.empty_cache
     return test_metrics
@@ -470,12 +344,6 @@ def train_model(
         val_ds,
         compute_metrics,
         experiment_config.patience,
-        loss_type=experiment_config.loss_type,
-        focal_alpha=experiment_config.focal_alpha,
-        focal_gamma=experiment_config.focal_gamma,
-        gamma_pos=experiment_config.gamma_pos,
-        gamma_neg=experiment_config.gamma_neg,
-        num_classes=3,  # Add this for loss functions that need it
     )
 
     trainer.train()
@@ -483,9 +351,7 @@ def train_model(
         trainer.save_model(f"{save_name}/finetuned_model")
     cleanup()
 
-    training_args_dict = training_args_to_dict(
-        training_args, experiment_config.patience, experiment_config.loss_type
-    )
+    training_args_dict = training_args_to_dict(training_args, experiment_config.patience)
     test_metrics = evaluate_and_cleanup(trainer, test_ds, model_name)
     test_metrics["training_args"] = training_args_dict
     return {}, test_metrics

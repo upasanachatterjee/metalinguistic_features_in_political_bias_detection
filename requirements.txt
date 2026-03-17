@@ -16,3 +16,4 @@ ruff==0.12.7
 tomli==2.0.1
 transformers==4.44.2
 datasets
+dotenv

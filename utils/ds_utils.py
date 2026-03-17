@@ -13,8 +13,12 @@ import json
 from dotenv import load_dotenv
 from transformers import set_seed
 
-UNK = None
-SEP = None
+# Load tag-group mapping once at module level to avoid re-reading per batch
+try:
+    with open("reversed_tags_kmeans_100.json") as _f:
+        _TAG_GROUPS: dict = json.load(_f)
+except FileNotFoundError:
+    _TAG_GROUPS = {}
 
 
 # Download required NLTK models once
@@ -135,212 +139,6 @@ def _convert_single_stringified_list(text: str) -> str:
             return text
 
 
-# -----------------------------------------------------------
-# 2) A fused function that (a) converts stringified lists → text, then
-#    (b) splits long documents into chunks of ≤max_length tokens, all in one pass.
-#    To avoid repeated calls to tokenizer.encode, we use tokenizer(
-#    texts, return_length=True ) on a batch of candidate chunks.
-# -----------------------------------------------------------
-def _batched_convert_and_chunk(
-    batch: Dict[str, List[Any]],
-    tokenizer: PreTrainedTokenizerBase,
-    max_length: int = 1024,
-) -> Dict[str, List[Any]]:
-    """
-    Input `batch` has keys: "text", "int_bias", "id". Each is a list of length B.
-    Output yields:
-      {
-        "text":    [chunk_text_1, chunk_text_2, …],
-        "int_bias":[bias_of_chunk_1, bias_of_chunk_2, …],
-        "id":      [id_of_chunk_1,   id_of_chunk_2,   …]
-      }
-    across all sentences in all B examples.
-
-    We do this in one pass per batch.
-    """
-    out_texts: List[str] = []
-    out_bias: List[int] = []
-    out_ids: List[Any] = []
-
-    # 1) First convert each stringified‐list → plain string
-    converted_texts = [_convert_single_stringified_list(txt) for txt in batch["text"]]
-
-    # 2) For each example, split into sentences, build candidate sentence‐by‐sentence chunks,
-    #    then measure token‐length for batches of candidate chunks to avoid repeated .encode() calls.
-    for doc_text, label, example_id in zip(
-        converted_texts, batch["int_bias"], batch["id"]
-    ):
-        sentences = sent_tokenize(doc_text)
-
-        # We'll accumulate sentence‐groups in `current_chunk_sents`
-        current_chunk_sents: List[str] = []
-
-        for sent in sentences:
-            if not current_chunk_sents:
-                # start new chunk
-                current_chunk_sents = [sent]
-                continue
-
-            current_chunk_sents.append(sent)
-
-        # After collecting all sentences in current_chunk_sents, we just need to split into chunks
-        # where each chunk ≤ max_length tokens. A simple way: greedily accumulate sentences into chunks,
-        # but every time the combined text might exceed, we check its token length in bulk.
-
-        # Re‐split into final chunks by checking actual token lengths with the tokenizer in a batch:
-        finalized_chunks: List[str] = []
-        temp_chunk: List[str] = []
-
-        for sent in sent_tokenize(doc_text):
-            temp_chunk.append(sent)
-            joined = " ".join(temp_chunk)
-
-            # Only call tokenizer when the joined text is “likely” near max_length.
-            # For a large document, the number of sentences is small, so this is still O(#sentences).
-            enc = tokenizer(joined, truncation=False, padding=False, return_length=True)
-
-            token_len = enc["length"][0]  # Get the length of the first (and only) item
-
-            if token_len > max_length:
-                # Flush the previous chunk (without this sentence)
-                prev_chunk = " ".join(temp_chunk[:-1])
-                finalized_chunks.append(prev_chunk)
-
-                # Start a new chunk with just this sentence
-                temp_chunk = [sent]
-
-        # Whatever remains in temp_chunk is also a chunk
-        if temp_chunk:
-            finalized_chunks.append(" ".join(temp_chunk))
-
-        # Append all finalized_chunks to outputs
-        for chunk_text in finalized_chunks:
-            out_texts.append(chunk_text)
-            out_bias.append(label)
-            out_ids.append(example_id)
-
-    return {"text": out_texts, "int_bias": out_bias, "id": out_ids}
-
-
-def _batched_convert_and_chunk_with_sentiments(
-    batch: Dict[str, List[Any]],
-    tokenizer: PreTrainedTokenizerBase,
-    max_length: int = 1024,
-) -> Dict[str, List[Any]]:
-    """
-    Input `batch` has keys: "text", "int_bias", "id". Each is a list of length B.
-    Output yields:
-      {
-        "text":    [chunk_text_1, chunk_text_2, …],
-        "int_bias":[bias_of_chunk_1, bias_of_chunk_2, …],
-        "id":      [id_of_chunk_1,   id_of_chunk_2,   …]
-      }
-    across all sentences in all B examples.
-
-    We do this in one pass per batch.
-    """
-    out_texts: List[str] = []
-    out_bias: List[int] = []
-    out_ids: List[Any] = []
-
-    # 1) First convert each stringified‐list → plain string
-    converted_texts = [_convert_single_stringified_list(txt) for txt in batch["text"]]
-
-    # 2) For each example, split into sentences, build candidate sentence‐by‐sentence chunks,
-    #    then measure token‐length for batches of candidate chunks to avoid repeated .encode() calls.
-    for doc_text, label, example_id, k1, v1, k2, v2, k3, v3, k4, v4, k5, v5 in zip(
-        converted_texts,
-        batch["int_bias"],
-        batch["id"],
-        batch["text_topic_0"],
-        batch["text_sentiment_0"],
-        batch["text_topic_1"],
-        batch["text_sentiment_1"],
-        batch["text_topic_2"],
-        batch["text_sentiment_2"],
-        batch["text_topic_3"],
-        batch["text_sentiment_3"],
-        batch["text_topic_4"],
-        batch["text_sentiment_4"],
-    ):
-        sentences = sent_tokenize(doc_text)
-
-        SEP = tokenizer.sep_token
-        UNK = tokenizer.unk_token
-
-        v1 = get_sign(v1, UNK)
-        v2 = get_sign(v2, UNK)
-        v3 = get_sign(v3, UNK)
-        v4 = get_sign(v4, UNK)
-        v5 = get_sign(v5, UNK)
-
-        tag_groups = json.loads(open("reversed_tags_kmeans_100.json").read())
-        k1 = tag_groups.get(k1, UNK)
-        k2 = tag_groups.get(k2, UNK)
-        k3 = tag_groups.get(k3, UNK)
-        k4 = tag_groups.get(k4, UNK)
-        k5 = tag_groups.get(k5, UNK)
-
-        # for k, v in zip([k2, k3, k4, k5], [v2, v3, v4, v5]):
-        #     if k1 == k and v != UNK:
-        #         if v1 == UNK:
-        #             v1 = v
-        #         else:
-        #             v1 += v
-
-        SENT = f"{k1} {v1} {SEP} {k2} {v2} {SEP} {k3} {v3} {SEP} {k4} {v4} {SEP} {k5} {v5} {SEP} "
-
-        # We'll accumulate sentence‐groups in `current_chunk_sents`
-        current_chunk_sents: List[str] = []
-
-        for sent in sentences:
-            if not current_chunk_sents:
-                # start new chunk
-                current_chunk_sents = [sent]
-                continue
-
-            current_chunk_sents.append(sent)
-
-        # After collecting all sentences in current_chunk_sents, we just need to split into chunks
-        # where each chunk ≤ max_length tokens. A simple way: greedily accumulate sentences into chunks,
-        # but every time the combined text might exceed, we check its token length in bulk.
-
-        # Re‐split into final chunks by checking actual token lengths with the tokenizer in a batch:
-        finalized_chunks: List[str] = []
-        temp_chunk: List[str] = []
-
-        for sent in sent_tokenize(doc_text):
-            temp_chunk.append(sent)
-            joined = " ".join(temp_chunk)
-
-            # Only call tokenizer when the joined text is “likely” near max_length.
-            # For a large document, the number of sentences is small, so this is still O(#sentences).
-            enc = tokenizer(joined, truncation=False, padding=False, return_length=True)
-
-            token_len = enc["length"][0]  # Get the length of the first (and only) item
-
-            if token_len > max_length - 20:
-                # Flush the previous chunk (without this sentence)
-                prev_chunk = " ".join(temp_chunk[:-1])
-                finalized_chunks.append(prev_chunk)
-
-                # Start a new chunk with just this sentence
-                temp_chunk = [sent]
-
-        # Whatever remains in temp_chunk is also a chunk
-        if temp_chunk:
-            finalized_chunks.append(temp_chunk)
-
-        # Append all finalized_chunks to outputs
-        for chunk_text in finalized_chunks:
-            chunk_with_sentiment = f"{SENT} {chunk_text}"
-            out_texts.append(chunk_with_sentiment)
-            out_bias.append(label)
-            out_ids.append(example_id)
-
-    return {"text": out_texts, "int_bias": out_bias, "id": out_ids}
-
-
 def get_sign(v, UNK) -> int:
     if isinstance(v, (type(None))):
         return UNK
@@ -379,12 +177,11 @@ def prepend_sentiments(
         v4 = get_sign(v4, UNK)
         v5 = get_sign(v5, UNK)
 
-        tag_groups = json.loads(open("reversed_tags_kmeans_100.json").read())
-        k1 = tag_groups.get(k1, UNK)
-        k2 = tag_groups.get(k2, UNK)
-        k3 = tag_groups.get(k3, UNK)
-        k4 = tag_groups.get(k4, UNK)
-        k5 = tag_groups.get(k5, UNK)
+        k1 = _TAG_GROUPS.get(k1, UNK)
+        k2 = _TAG_GROUPS.get(k2, UNK)
+        k3 = _TAG_GROUPS.get(k3, UNK)
+        k4 = _TAG_GROUPS.get(k4, UNK)
+        k5 = _TAG_GROUPS.get(k5, UNK)
 
         for k, v in zip([k2, k3, k4, k5], [v2, v3, v4, v5]):
             if k1 == k and v != UNK:
@@ -451,82 +248,55 @@ def undersample_optimized(dataset: Dataset, seed: int = 42) -> Dataset:
 def clean_dataset_optimized(
     dataset: Dataset,
     tokenizer: PreTrainedTokenizerBase,
-    theme: str,
-    grouped_topics: Dict[str, List[str]],
     max_length: int = 1024,
     num_proc: int = 4,
-    truncate=False,
     sentiments=False,
-    validation=False,
+    skip_undersampling=False,
+    use_bias_keys: bool = True,
 ) -> Dataset | None:
     """
-    1. Filter by `theme`.
-    2. Undersample (balance) via `undersample_optimized`.
-    3. Convert stringified lists → text AND split into ≤max_length‐token chunks in one pass.
-    4. Flatten the result.
-    5. Class‐encode labels and remap to "label".
-    6. Tokenize all text to input_ids/attention_mask.
+    1. Undersample (balance) via `undersample_optimized`.
+    2. Convert stringified lists → text (truncation applied at tokenization).
+    3. Flatten the result.
+    4. Class‐encode labels and remap to "label".
+    5. Tokenize all text to input_ids/attention_mask.
     """
 
     print("Initial label distribution:", Counter(dataset["int_bias"]))
 
-    # ---- 1) Filter by theme (keep only topics in grouped_topics[theme]) ----
-    if theme:
-        filtered = dataset.filter(
-            lambda ex: ex["topic"] in grouped_topics[theme], batched=False
-        )
-    else:
-        filtered = dataset
+    filtered = dataset
 
     if len(filtered) < 1:
         return None
 
-    # ---- 2) Undersample (balanced) ----
-    if validation:
+    # ---- 1) Undersample (balanced) ----
+    if skip_undersampling:
         balanced = filtered
     else:
         balanced = undersample_per_topic(filtered)
 
-    # ---- 3) Convert & chunk in one batched pass (multi‐proc) ----
-    #     This returns a Dataset whose columns are only "text", "int_bias", "id".
-    if truncate:
-        if sentiments:
-            chunked = balanced.map(
-                lambda batch: prepend_sentiments(batch, tokenizer),
-                batched=True,
-                remove_columns=balanced.column_names,
-                num_proc=num_proc,
-            )
-        else:
-            chunked = balanced
+    # ---- 2) Optionally prepend sentiments ----
+    if sentiments:
+        chunked = balanced.map(
+            lambda batch: prepend_sentiments(batch, tokenizer),
+            batched=True,
+            remove_columns=balanced.column_names,
+            num_proc=num_proc,
+        )
     else:
-        if sentiments:
-            chunked = balanced.map(
-                lambda batch: _batched_convert_and_chunk_with_sentiments(
-                    batch, tokenizer, max_length
-                ),
-                batched=True,
-                remove_columns=balanced.column_names,
-                num_proc=num_proc,
-            )
-        else:
-            chunked = balanced.map(
-                lambda batch: _batched_convert_and_chunk(batch, tokenizer, max_length),
-                batched=True,
-                remove_columns=balanced.column_names,
-                num_proc=num_proc,
-            )
+        chunked = balanced
     # ---- 4) Flatten: each row is now a single chunk with its label and id ----
     chunked = chunked.flatten()
 
     # ---- 5) Class‐encode labels, rename to "label", select only needed columns ----
     # chunked = chunked.class_encode_column("int_bias")  # now int_bias → class IDs
 
-    chunked = chunked.rename_column("int_bias", "bias_labels")
-    chunked = chunked.select_columns(["bias_labels", "text", "id"])
-
-    # chunked = chunked.rename_column("int_bias", "labels")
-    # chunked = chunked.select_columns(["labels", "text", "id"])
+    if use_bias_keys:
+        chunked = chunked.rename_column("int_bias", "bias_labels")
+        chunked = chunked.select_columns(["bias_labels", "text", "id"])
+    else:
+        chunked = chunked.rename_column("int_bias", "labels")
+        chunked = chunked.select_columns(["labels", "text", "id"])
     # ---- 6) Tokenize all final chunks (batched) ----
     def tokenize_batch(exs: Dict[str, List[Any]]) -> Dict[str, Any]:
         return tokenizer(
@@ -539,7 +309,8 @@ def clean_dataset_optimized(
         remove_columns=["text"],  # no longer need raw text after tokenization
         num_proc=num_proc,
     )
-    tokenized = tokenized.rename_column("input_ids", "bias_input_ids")
-    tokenized = tokenized.rename_column("attention_mask", "bias_attention_mask")
+    if use_bias_keys:
+        tokenized = tokenized.rename_column("input_ids", "bias_input_ids")
+        tokenized = tokenized.rename_column("attention_mask", "bias_attention_mask")
 
     return tokenized
