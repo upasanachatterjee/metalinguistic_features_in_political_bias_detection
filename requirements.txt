@@ -17,3 +17,4 @@ tomli==2.0.1
 transformers==4.44.2
 datasets
 dotenv
+scikit-learn

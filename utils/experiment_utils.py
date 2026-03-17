@@ -295,7 +295,7 @@ def make_trainer(
     train_ds,
     eval_ds,
     compute_fn,
-    patience: int = 3,
+    patience: int = 5,
 ) -> Trainer:
     print("patience=", patience)
     print("compute_fn=", compute_fn)
