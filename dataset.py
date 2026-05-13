@@ -102,20 +102,32 @@ class MemoryEfficientDataset(TorchDataset):
         self.tokenizer = tokenizer
         self.text_col = text_col
 
-        # Load dataset with memory mapping (doesn't load into RAM)
-        print(f"🗂️  Loading {dataset_name} with memory mapping...", flush=True)
-        t = time.perf_counter()
-        dataset_raw = load_dataset(
-            dataset_name,
-            split=split,
-            revision="refs/convert/parquet",
-            streaming=False,  # Use memory mapping instead of streaming
-            cache_dir=cache_dir,
-            keep_in_memory=False,  # Don't load into memory
-        )
-        print(f"   [load_dataset] returned in {time.perf_counter() - t:.1f}s", flush=True)
+        state = PartialState()
 
-        # Ensure we have a Dataset object (not DatasetDict)
+        # All ranks racing into load_dataset hammers the same HF cache_dir and
+        # its filelock; if any rank crashes mid-load it leaves an orphan .lock
+        # that deadlocks the next launch. main_process_first() lets rank 0 warm
+        # (or repair) the cache alone, then the other ranks read it warm.
+        print(
+            f"🗂️  Loading {dataset_name} with memory mapping... (rank={state.process_index})",
+            flush=True,
+        )
+        t = time.perf_counter()
+        with state.main_process_first():
+            dataset_raw = load_dataset(
+                dataset_name,
+                split=split,
+                revision="refs/convert/parquet",
+                streaming=False,
+                cache_dir=cache_dir,
+                keep_in_memory=False,
+            )
+        print(
+            f"   [load_dataset] rank={state.process_index} returned in "
+            f"{time.perf_counter() - t:.1f}s",
+            flush=True,
+        )
+
         if isinstance(dataset_raw, Dataset):
             self.dataset = dataset_raw
         else:
@@ -123,7 +135,6 @@ class MemoryEfficientDataset(TorchDataset):
 
         if require_nonempty_themes_and_tone:
             before = len(self.dataset)
-            state = PartialState()
             cache_path = _filter_index_cache_path(
                 cache_dir=cache_dir or "./cache",
                 dataset_name=dataset_name,
@@ -132,18 +143,23 @@ class MemoryEfficientDataset(TorchDataset):
             )
             keep_indices = _build_or_load_filter_index(self.dataset, cache_path, state)
             t = time.perf_counter()
-            # `select` with an int array creates a lightweight view over the underlying
-            # Arrow file rather than materializing a new table per rank.
-            self.dataset = self.dataset.select(keep_indices)
+            # `select` writes a per-rank indices-mapping arrow file into the HF
+            # cache_dir; stagger it through main_process_first so rank 0 writes
+            # first and the other ranks pick up the warm cache instead of all
+            # 8 racing to write the same hashed path.
+            with state.main_process_first():
+                self.dataset = self.dataset.select(keep_indices)
             print(
-                f"   [select] applied filter indices in {time.perf_counter() - t:.1f}s "
-                f"(rank={state.process_index})",
+                f"   [select] rank={state.process_index} applied filter indices in "
+                f"{time.perf_counter() - t:.1f}s",
                 flush=True,
             )
-            print(
-                f"🔎 Subsample: kept {len(self.dataset):,}/{before:,} rows with non-empty V2Themes and V2Tone",
-                flush=True,
-            )
+            if state.is_main_process:
+                print(
+                    f"🔎 Subsample: kept {len(self.dataset):,}/{before:,} rows "
+                    f"with non-empty V2Themes and V2Tone",
+                    flush=True,
+                )
 
         # Remove columns we don't need to save memory (keeping group_uid for triplet formation)
         t = time.perf_counter()
