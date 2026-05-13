@@ -37,8 +37,8 @@ class DatasetConfig:
     custom_dataset: Optional[str] = None
 
 
-ALLSIDES_EXTENDED_MEDIA_SPLIT = "dragonslayer631/article-bias-prediction-media-splits-updated"
-ALLSIDES_EXTENDED_RANDOM_SPLIT = "dragonslayer631/allsides_random_split_extended"
+ALLSIDES_EXTENDED_MEDIA_SPLIT = "upasanachatterjee/article-bias-prediction-media-splits-updated"
+ALLSIDES_EXTENDED_RANDOM_SPLIT = "upasanachatterjee/allsides_random_split_extended"
 _BATCH_SIZE = 64
 _GRAD_ACCUMULATION = 32
 _NUM_WORKERS = 8
@@ -118,7 +118,7 @@ def load_and_rename_dataset(sentiment: bool) -> DatasetDict:
     {'bias'→'int_bias', 'content'→'text', 'ID'→'id'}
     and a 'validation' split set up.
     """
-    path = "dragonslayer631/allsides_media-splits_sentiments"
+    path = "upasanachatterjee/allsides_media-splits_sentiments"
     print("loading allsides_media-splits_sentiments")
     ds: DatasetDict = load_dataset(path)
     ds = (
@@ -153,7 +153,7 @@ def run_single(
     )
 
     # 2) train & evaluate
-    name = make_experiment_name(model_name, None, False, dataset_config.sentiment)
+    name = make_experiment_name(model_name, None, True, dataset_config.sentiment)
     print(f"Training {name}")
     metrics_val, metrics_test = train_model(
         model, train, test, validation, f"{loc}/{name}", model_name, experiment_config
@@ -183,7 +183,7 @@ def _load_dataset_by_config(dataset_config: DatasetConfig) -> DatasetDict:
         ds = load_dataset(dataset_config.custom_dataset)
         ds = ds.rename_column("label", "int_bias").rename_column("uuid", "id")
         ds["validation"] = ds["test"]
-    elif dataset_config.custom_dataset and "dragonslayer631" in dataset_config.custom_dataset:
+    elif dataset_config.custom_dataset and "upasanachatterjee" in dataset_config.custom_dataset:
         ds = load_dataset(dataset_config.custom_dataset)
         if not ds.get("validation"):
             ds["validation"] = ds["test"]

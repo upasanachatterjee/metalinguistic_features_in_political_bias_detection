@@ -15,10 +15,13 @@ import torch.nn.functional as F
 
 class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
-        labels = inputs.get("bias_labels") or inputs.get("labels")
+        _bias_labels = inputs.get("bias_labels")
+        labels = _bias_labels if _bias_labels is not None else inputs.get("labels")
         outputs = model(**inputs)
-        logits = outputs.get("bias_logits") or outputs.get("logits")
-        loss = outputs.get("bias_loss") or outputs.get("loss")
+        _bias_logits = outputs.get("bias_logits")
+        logits = _bias_logits if _bias_logits is not None else outputs.get("logits")
+        _bias_loss = outputs.get("bias_loss")
+        loss = _bias_loss if _bias_loss is not None else outputs.get("loss")
         if loss is None:
             loss = F.cross_entropy(logits, labels)
         if not isinstance(outputs, dict):
@@ -28,15 +31,18 @@ class CustomTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        labels = inputs.get("bias_labels") or inputs.get("labels")
+        _bias_labels = inputs.get("bias_labels")
+        labels = _bias_labels if _bias_labels is not None else inputs.get("labels")
 
         with torch.no_grad():
             outputs = model(**inputs)
 
             # Extract bias-specific outputs
             if isinstance(outputs, dict):
-                loss = outputs.get("bias_loss") or outputs.get("loss")
-                logits = outputs.get("bias_logits") or outputs.get("logits")
+                _bias_loss = outputs.get("bias_loss")
+                loss = _bias_loss if _bias_loss is not None else outputs.get("loss")
+                _bias_logits = outputs.get("bias_logits")
+                logits = _bias_logits if _bias_logits is not None else outputs.get("logits")
             else:
                 loss = outputs.loss if hasattr(outputs, "loss") else None
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs

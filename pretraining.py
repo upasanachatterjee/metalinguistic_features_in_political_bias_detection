@@ -1,10 +1,11 @@
+import argparse
 import torch
 import torch.nn as nn
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from dataset import build_dataloaders
 from model import MultiTaskRoberta
-from pretraining_utils import TrainArgs, TaskSpec, calculate_eta
+from pretraining_utils import calculate_eta, load_run_config
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 import time
 from transformers.optimization import get_linear_schedule_with_warmup
@@ -13,8 +14,12 @@ import os
 # Environment setup (wandb removed)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Avoid tokenizer warnings
 
-# Create output directories
-output_dir = "./tlp_mlm_mtl_ckpt_8_gpu_4090_48gb"
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", required=True, help="Path to run YAML config")
+cli = parser.parse_args()
+cfg = load_run_config(cli.config)
+
+output_dir = cfg.output_dir
 os.makedirs(output_dir, exist_ok=True)
 
 # Set random seed for reproducibility
@@ -26,10 +31,10 @@ accelerator = Accelerator(
     gradient_accumulation_steps=1, project_dir=output_dir, kwargs_handlers=[ddp_kwargs]
 )
 
-args = TrainArgs()
+args = cfg.train_args
 
 # Define which tasks to run
-available_tasks = ["triplet", "mlm"]
+available_tasks = cfg.tasks
 
 
 # Multi-GPU information
@@ -45,8 +50,9 @@ if accelerator.is_main_process:
 
 print(f"TrainArgs loaded: {args.num_epochs} epochs, {args.model_name}")
 
-theme_count = 2000  # Default value
-tone_count = 2  # Default value
+theme_count = cfg.theme_count
+tone_count = cfg.tone_count
+subsample = cfg.task_spec.require_nonempty_themes_and_tone
 
 model = MultiTaskRoberta(
     num_themes=theme_count, num_tones=tone_count, num_bias_classes=None
@@ -59,7 +65,7 @@ effective_batch_size = (
     * accelerator.num_processes
     * accelerator.gradient_accumulation_steps
 )
-base_lr = 5e-5
+base_lr = cfg.base_lr
 optimizer = torch.optim.AdamW(
     model.parameters(), lr=base_lr, weight_decay=0.01, fused=True
 )
@@ -70,11 +76,7 @@ print(" - Loading tokenizer for roberta-base...")
 tokenizer = AutoTokenizer.from_pretrained("roberta-base")
 print("   Tokenizer loaded")
 
-task_spec = TaskSpec(
-    dataset_name="dragonslayer631/bignewsalign-with-gdelt",
-    themes_path="top_themes.txt",
-    max_triplet_samples=8,
-)
+task_spec = cfg.task_spec
 
 print(" - Building dataloaders (this may take a moment)...")
 dataloaders = build_dataloaders(
@@ -144,7 +146,7 @@ if accelerator.is_main_process:
     print("\nTraining Configuration Summary:")
     print(f"   - Model: {args.model_name}")
     print(f"   - Epochs: {args.num_epochs}")
-    print("   - Learning rate: 0.0005")
+    print(f"   - Learning rate: {base_lr}")
     print("   - Weight decay: 0.01")
     print("   - Mixed precision: fp16")
     print(f"   - Number of GPUs: {accelerator.num_processes}")
@@ -169,18 +171,18 @@ print("   - MSE loss (for tone regression)")
 print("\n Initializing task iterators and training order...")
 iters = {}
 
-# Initialize iterators for available dataloaders
-if dataloaders.get("triplet"):
-    iters["triplet"] = iter(dataloaders["triplet"])
+# Maps logical task name -> dataloader key
+TASK_TO_DL = {
+    "triplet_ideology": "triplet_ideology",
+    "triplet_story": "triplet_story",
+    "mlm": "mlm",
+    "tone": "regression",
+    "themes": "multilabel",
+}
 
-if dataloaders.get("mlm"):
-    iters["mlm"] = iter(dataloaders["mlm"])
-
-if dataloaders.get("regression"):
-    iters["tone"] = iter(dataloaders["regression"])
-
-if dataloaders.get("multilabel"):
-    iters["themes"] = iter(dataloaders["multilabel"])
+for task_name, dl_name in TASK_TO_DL.items():
+    if dataloaders.get(dl_name):
+        iters[task_name] = iter(dataloaders[dl_name])
 
 print("\nTraining configuration complete:")
 print(f"   - Available tasks: {available_tasks}")
@@ -203,6 +205,7 @@ with open(log_file, "w") as f:
     f.write(f"Available Tasks: {available_tasks}\n")
     f.write(f"Using num themes: {theme_count} and num tones: {tone_count}\n")
     f.write(f"Num triplets per batch: {task_spec.max_triplet_samples}\n")
+    f.write(f"Subsampling for themes/tone: {subsample}\n")
     f.write(f"Batch size: {args.batch_size}\n")
     f.write(f"Num epochs: {args.num_epochs}\n")
     f.write("=" * 50 + "\n\n")
@@ -214,10 +217,22 @@ steps_in_current_epoch = 0
 model.train()
 
 # Loss tracking
-loss_accumulator = {"triplet": [], "mlm": [], "tone": [], "themes": []}
+loss_accumulator = {
+    "triplet_ideology": [],
+    "triplet_story": [],
+    "mlm": [],
+    "tone": [],
+    "themes": [],
+}
 
 # Missing samples tracking
-missing_samples = {"triplet": 0, "mlm": 0, "tone": 0, "themes": 0}
+missing_samples = {
+    "triplet_ideology": 0,
+    "triplet_story": 0,
+    "mlm": 0,
+    "tone": 0,
+    "themes": 0,
+}
 
 print(f"\n Loss tracking initialized for {len(loss_accumulator)} tasks")
 
@@ -228,14 +243,7 @@ def get_next_batch(task_name, iterators, dataloaders):
         return next(iterators[task_name])
     except StopIteration:
         print(f"   Reinitializing {task_name} iterator (end of dataset reached)")
-        # Map task names to dataloader names
-        dataloader_mapping = {
-            "triplet": "triplet",
-            "mlm": "mlm",
-            "tone": "regression",
-            "themes": "multilabel",
-        }
-        dl_name = dataloader_mapping.get(task_name, task_name)
+        dl_name = TASK_TO_DL.get(task_name, task_name)
         iterators[task_name] = iter(dataloaders[dl_name])
         return next(iterators[task_name])
 
@@ -264,29 +272,33 @@ while epoch < args.num_epochs:
             # 1. Combine batches from all available tasks into one
             combined_batch = {}
             for task_name in available_tasks:
-                # Map new task names to old dataloader names
-                dataloader_mapping = {
-                    "triplet": "triplet",
-                    "mlm": "mlm",
-                    "themes": "multilabel",
-                    "tone": "regression",
-                }
-                dl_name = dataloader_mapping.get(task_name)
+                dl_name = TASK_TO_DL.get(task_name)
                 if not dl_name:
                     continue
 
                 batch = get_next_batch(task_name, iters, dataloaders)
                 if batch is not None and not batch.get("_skip", False):
                     # Rename keys to be unique and descriptive for the model
-                    if task_name == "triplet":
+                    if task_name == "triplet_ideology":
                         combined_batch.update(
                             {
-                                "a_ids": batch["a_ids"],
-                                "a_mask": batch["a_mask"],
-                                "p_ids": batch["p_ids"],
-                                "p_mask": batch["p_mask"],
-                                "n_ids": batch["n_ids"],
-                                "n_mask": batch["n_mask"],
+                                "ideo_a_ids": batch["a_ids"],
+                                "ideo_a_mask": batch["a_mask"],
+                                "ideo_p_ids": batch["p_ids"],
+                                "ideo_p_mask": batch["p_mask"],
+                                "ideo_n_ids": batch["n_ids"],
+                                "ideo_n_mask": batch["n_mask"],
+                            }
+                        )
+                    elif task_name == "triplet_story":
+                        combined_batch.update(
+                            {
+                                "story_a_ids": batch["a_ids"],
+                                "story_a_mask": batch["a_mask"],
+                                "story_p_ids": batch["p_ids"],
+                                "story_p_mask": batch["p_mask"],
+                                "story_n_ids": batch["n_ids"],
+                                "story_n_mask": batch["n_mask"],
                             }
                         )
                     elif task_name == "themes":
@@ -331,11 +343,18 @@ while epoch < args.num_epochs:
                 # Log individual losses returned from the model
                 if accelerator.is_main_process:
                     if (
-                        "triplet_loss" in outputs
-                        and outputs["triplet_loss"] is not None
+                        "ideo_triplet_loss" in outputs
+                        and outputs["ideo_triplet_loss"] is not None
                     ):
-                        loss_accumulator["triplet"].append(
-                            outputs["triplet_loss"].item()
+                        loss_accumulator["triplet_ideology"].append(
+                            outputs["ideo_triplet_loss"].item()
+                        )
+                    if (
+                        "story_triplet_loss" in outputs
+                        and outputs["story_triplet_loss"] is not None
+                    ):
+                        loss_accumulator["triplet_story"].append(
+                            outputs["story_triplet_loss"].item()
                         )
                     if "theme_loss" in outputs and outputs["theme_loss"] is not None:
                         loss_accumulator["themes"].append(outputs["theme_loss"].item())
@@ -355,7 +374,7 @@ while epoch < args.num_epochs:
         if accelerator.is_main_process and step % args.log_every == 0:
             # Calculate average losses for each task
             task_losses = {}
-            for task_name in ["triplet", "mlm", "tone", "themes"]:
+            for task_name in ["triplet_ideology", "triplet_story", "mlm", "tone", "themes"]:
                 if loss_accumulator[task_name]:
                     avg_loss = sum(loss_accumulator[task_name]) / len(
                         loss_accumulator[task_name]
@@ -447,13 +466,7 @@ while epoch < args.num_epochs:
         print("Preparing for next epoch...")
         # Reinitialize iterators for next epoch
         for task_name in iters.keys():
-            dataloader_mapping = {
-                "triplet": "triplet",
-                "mlm": "mlm",
-                "tone": "regression",
-                "themes": "multilabel",
-            }
-            dl_name = dataloader_mapping.get(task_name, task_name)
+            dl_name = TASK_TO_DL.get(task_name, task_name)
             if dl_name and dataloaders.get(dl_name):
                 iters[task_name] = iter(dataloaders[dl_name])
         print(f"All iterators reinitialized for epoch {epoch + 1}")

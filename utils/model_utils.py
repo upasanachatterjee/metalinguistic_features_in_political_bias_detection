@@ -7,7 +7,7 @@ BART = "facebook/bart-base"
 BART_LARGE = "facebook/bart-large"
 ROBERTA = "FacebookAI/roberta-base"
 POLITICS = "launch/POLITICS"
-IDEOLOGY_CLASSIFIER = "dragonslayer631/ideology_classifier_finetuned"
+IDEOLOGY_CLASSIFIER = "upasanachatterjee/ideology_classifier_finetuned"
 
 
 def load_model(model):

@@ -1,6 +1,7 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import torch
+import yaml
 from huggingface_hub import login
 import time
 from datetime import datetime, timedelta
@@ -22,6 +23,11 @@ class TaskSpec:
     regression_col: Optional[str] = "V2Tone"  # column containing float target(s)
     tones_count: int = 2
     max_triplet_samples: int = 16
+    # Group-aware sampler for the story triplet objective
+    group_batch_num_groups: int = 8
+    group_batch_per_group: int = 4
+    # Subsampling: drop rows where V2Themes or V2Tone is missing/empty
+    require_nonempty_themes_and_tone: bool = False
 
 
 @dataclass
@@ -35,6 +41,33 @@ class TrainArgs:
     # dataloader args
     dataloader_num_workers: int = 4  # More workers for high-throughput GPUs
     pin_memory: bool = True  # Faster CPU->GPU transfer
+
+
+@dataclass
+class RunConfig:
+    output_dir: str
+    tasks: List[str] = field(
+        default_factory=lambda: ["triplet_ideology", "triplet_story", "mlm"]
+    )
+    theme_count: int = 2000
+    tone_count: int = 2
+    base_lr: float = 5e-5
+    train_args: TrainArgs = field(default_factory=TrainArgs)
+    task_spec: TaskSpec = field(
+        default_factory=lambda: TaskSpec(
+            dataset_name="upasanachatterjee/bignewsalign-with-gdelt",
+            themes_path="top_themes.txt",
+            max_triplet_samples=8,
+        )
+    )
+
+
+def load_run_config(path: str) -> RunConfig:
+    with open(path) as f:
+        raw = yaml.safe_load(f) or {}
+    train_args = TrainArgs(**raw.pop("train_args", {}))
+    task_spec = TaskSpec(**raw.pop("task_spec", {}))
+    return RunConfig(train_args=train_args, task_spec=task_spec, **raw)
 
 
 def login_to_huggingface(token):

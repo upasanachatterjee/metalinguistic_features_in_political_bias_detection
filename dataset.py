@@ -1,15 +1,25 @@
+import random
 from datasets import Dataset, load_dataset
-from torch.utils.data import DataLoader, Dataset as TorchDataset
+from torch.utils.data import DataLoader, Dataset as TorchDataset, Sampler
 import os
 from pretraining_utils import TaskSpec, TrainArgs, login_to_huggingface
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.tokenization_utils import PreTrainedTokenizer
 from collators.triplet_collator import TripletDataCollator
+from collators.story_collator import StoryTripletCollator
 from collators.multi_label_collator import MultiLabelCollator
 from collators.regression_collator import RegressionCollator
 
 login_to_huggingface(os.getenv("hf_token"))
+
+
+def _has_themes_and_tone(ex: Dict[str, Any]) -> bool:
+    t = ex.get("V2Themes")
+    n = ex.get("V2Tone")
+    themes_ok = t is not None and str(t).strip() != ""
+    tone_ok = n is not None and str(n).strip() != ""
+    return themes_ok and tone_ok
 
 
 class MemoryEfficientDataset(TorchDataset):
@@ -25,6 +35,7 @@ class MemoryEfficientDataset(TorchDataset):
         text_col: str,
         tokenizer: PreTrainedTokenizer,
         cache_dir: Optional[str] = None,
+        require_nonempty_themes_and_tone: bool = False,
     ):
         self.tokenizer = tokenizer
         self.text_col = text_col
@@ -45,6 +56,13 @@ class MemoryEfficientDataset(TorchDataset):
             self.dataset = dataset_raw
         else:
             raise ValueError(f"Expected Dataset, got {type(dataset_raw)}")
+
+        if require_nonempty_themes_and_tone:
+            before = len(self.dataset)
+            self.dataset = self.dataset.filter(_has_themes_and_tone)
+            print(
+                f"🔎 Subsample: kept {len(self.dataset):,}/{before:,} rows with non-empty V2Themes and V2Tone"
+            )
 
         # Remove columns we don't need to save memory (keeping group_uid for triplet formation)
         columns_to_remove = ["source", "title", "html", "url", "date"]
@@ -81,53 +99,125 @@ class MemoryEfficientDataset(TorchDataset):
 
 
 def build_dataloaders(
-    tok: PreTrainedTokenizer, task_spec: TaskSpec, args: TrainArgs
+    tok: PreTrainedTokenizer,
+    task_spec: TaskSpec,
+    args: TrainArgs,
+    tasks_to_build: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """
     Build dataloaders with lazy loading - no pre-tokenization or RAM loading.
+
+    Pass `tasks_to_build` to skip loaders not needed for the current run. Task names:
+      - "mlm", "regression", "multilabel"
+      - "triplet_ideology" (random sampler, ideology mining)
+      - "triplet_story" (group-aware sampler, story mining)
+    Legacy "triplet" is treated as "triplet_ideology".
     """
     print("🚀 Building memory-efficient dataloaders with lazy loading...")
 
-    dataloaders = {}
+    tasks = set(tasks_to_build) if tasks_to_build is not None else {
+        "mlm", "regression", "triplet_ideology", "multilabel",
+    }
+    if "triplet" in tasks:
+        tasks.discard("triplet")
+        tasks.add("triplet_ideology")
 
-    # Optimized dataloader parameters for RTX 5090
+    dataloaders: Dict[str, Any] = {}
+
     loader_params = {
         "num_workers": 8,
         "pin_memory": True,
         "persistent_workers": True,
         "prefetch_factor": 4,
-        "tones_count": task_spec.tones_count,
     }
 
-    # Build datasets for each task type
-    print("   � Creating lazy datasets...")
-
-    # MLM Dataset
+    print("   Creating lazy datasets...")
     mlm_dataset = MemoryEfficientDataset(
         dataset_name=task_spec.dataset_name,
         split=task_spec.split,
         text_col=task_spec.text_col,
         tokenizer=tok,
+        require_nonempty_themes_and_tone=task_spec.require_nonempty_themes_and_tone,
     )
 
-    # Create dataloaders
-    print("   � Building dataloaders...")
+    print("   Building dataloaders...")
 
-    dataloaders["mlm"] = build_lazy_mlm_dataloader(
-        tok, args, mlm_dataset, **loader_params
-    )
-    dataloaders["regression"] = build_lazy_regression_dataloader(
-        tok, task_spec, args, mlm_dataset, **loader_params
-    )
-    dataloaders["triplet"] = build_lazy_triplet_dataloader(
-        tok, args, mlm_dataset, **loader_params
-    )
-    dataloaders["multilabel"] = build_lazy_multilabel_dataloader(
-        tok, task_spec, args, mlm_dataset, **loader_params
-    )
+    if "mlm" in tasks:
+        dataloaders["mlm"] = build_lazy_mlm_dataloader(
+            tok, args, mlm_dataset, **loader_params
+        )
+    if "regression" in tasks:
+        dataloaders["regression"] = build_lazy_regression_dataloader(
+            tok, task_spec, args, mlm_dataset, **loader_params
+        )
+    if "triplet_ideology" in tasks:
+        dataloaders["triplet_ideology"] = build_lazy_triplet_dataloader(
+            tok, args, mlm_dataset, **loader_params
+        )
+    if "triplet_story" in tasks:
+        dataloaders["triplet_story"] = build_lazy_story_triplet_dataloader(
+            tok, args, task_spec, mlm_dataset, **loader_params
+        )
+    if "multilabel" in tasks:
+        dataloaders["multilabel"] = build_lazy_multilabel_dataloader(
+            tok, task_spec, args, mlm_dataset, **loader_params
+        )
 
     print("   ✅ All lazy dataloaders built")
     return dataloaders
+
+
+class GroupBatchSampler(Sampler[List[int]]):
+    """Yields batches of indices that contain multiple articles sharing the same group_uid.
+
+    Each batch is composed of `num_groups` randomly chosen multi-article groups, each
+    contributing up to `per_group` indices, truncated to `batch_size`.
+    """
+
+    def __init__(
+        self,
+        dataset: "MemoryEfficientDataset",
+        batch_size: int,
+        num_groups: int,
+        per_group: int,
+        seed: Optional[int] = None,
+    ):
+        self.batch_size = batch_size
+        self.num_groups = num_groups
+        self.per_group = per_group
+
+        print("   Building group_uid index for GroupBatchSampler...")
+        group_uids = dataset.dataset["group_uid"]
+        groups: Dict[Any, List[int]] = {}
+        for i, g in enumerate(group_uids):
+            groups.setdefault(g, []).append(i)
+        self.groups = {g: idxs for g, idxs in groups.items() if len(idxs) >= 2}
+        self.group_keys = list(self.groups.keys())
+        self._multi_total = sum(len(v) for v in self.groups.values())
+        self.rng = random.Random(seed)
+        print(
+            f"   GroupBatchSampler: {len(self.group_keys):,} multi-article groups, "
+            f"{self._multi_total:,} indices, ~{len(self):,} batches/epoch"
+        )
+
+    def __iter__(self):
+        for _ in range(len(self)):
+            chosen = self.rng.sample(
+                self.group_keys, k=min(self.num_groups, len(self.group_keys))
+            )
+            batch: List[int] = []
+            for g in chosen:
+                items = self.groups[g]
+                if len(items) <= self.per_group:
+                    batch.extend(items)
+                else:
+                    batch.extend(self.rng.sample(items, k=self.per_group))
+                if len(batch) >= self.batch_size:
+                    break
+            yield batch[: self.batch_size]
+
+    def __len__(self):
+        return max(1, self._multi_total // self.batch_size)
 
 
 # ------------------------------
@@ -175,6 +265,29 @@ def build_lazy_triplet_dataloader(
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=base_collator,
+        **loader_kwargs,
+    )
+
+
+def build_lazy_story_triplet_dataloader(
+    tok: PreTrainedTokenizer,
+    args: TrainArgs,
+    spec: TaskSpec,
+    dataset: "MemoryEfficientDataset",
+    **loader_kwargs,
+) -> DataLoader:
+    """Build story-triplet dataloader using a group-aware batch sampler."""
+    sampler = GroupBatchSampler(
+        dataset,
+        batch_size=args.batch_size,
+        num_groups=spec.group_batch_num_groups,
+        per_group=spec.group_batch_per_group,
+    )
+    collator = StoryTripletCollator(triplet_downsample_size=spec.max_triplet_samples)
+    return DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=collator,
         **loader_kwargs,
     )
 
