@@ -1,5 +1,6 @@
 import hashlib
 import os
+import time
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -38,7 +39,8 @@ def _build_or_load_filter_index(
     os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
 
     if state.is_main_process and not os.path.exists(cache_path):
-        print(f"   Building filter index (one-time) at {cache_path}")
+        print(f"   [filter-index] Building (one-time) at {cache_path}", flush=True)
+        t0 = time.perf_counter()
 
         def _nonempty_mask(col: pa.ChunkedArray) -> pa.ChunkedArray:
             # Works whether the column is string-typed (treat empty/whitespace as missing)
@@ -51,16 +53,34 @@ def _build_or_load_filter_index(
                 return pc.and_(pc.is_valid(col), len_ok)
             return pc.is_valid(col)
 
+        t = time.perf_counter()
         themes_ok = _nonempty_mask(dataset_raw.data.column("V2Themes"))
         tone_ok = _nonempty_mask(dataset_raw.data.column("V2Tone"))
         keep_mask = pc.and_(themes_ok, tone_ok)
-        # Combine chunks → single numpy bool array, then take positions.
+        print(f"   [filter-index] arrow masks computed in {time.perf_counter() - t:.1f}s", flush=True)
+
+        t = time.perf_counter()
         keep_np = np.concatenate([np.asarray(chunk) for chunk in keep_mask.chunks])
         indices = np.flatnonzero(keep_np).astype(np.int64)
-        np.save(cache_path, indices)
-        print(f"   Filter index built: kept {len(indices):,}/{len(dataset_raw):,} rows")
+        print(f"   [filter-index] np concat+flatnonzero in {time.perf_counter() - t:.1f}s", flush=True)
 
+        t = time.perf_counter()
+        np.save(cache_path, indices)
+        print(f"   [filter-index] np.save in {time.perf_counter() - t:.1f}s", flush=True)
+
+        print(
+            f"   [filter-index] DONE in {time.perf_counter() - t0:.1f}s — "
+            f"kept {len(indices):,}/{len(dataset_raw):,} rows",
+            flush=True,
+        )
+
+    t_bar = time.perf_counter()
     state.wait_for_everyone()
+    print(
+        f"   [filter-index] rank={state.process_index} barrier waited "
+        f"{time.perf_counter() - t_bar:.1f}s",
+        flush=True,
+    )
     return np.load(cache_path, mmap_mode="r")
 
 
@@ -83,7 +103,8 @@ class MemoryEfficientDataset(TorchDataset):
         self.text_col = text_col
 
         # Load dataset with memory mapping (doesn't load into RAM)
-        print(f"🗂️  Loading {dataset_name} with memory mapping...")
+        print(f"🗂️  Loading {dataset_name} with memory mapping...", flush=True)
+        t = time.perf_counter()
         dataset_raw = load_dataset(
             dataset_name,
             split=split,
@@ -92,6 +113,7 @@ class MemoryEfficientDataset(TorchDataset):
             cache_dir=cache_dir,
             keep_in_memory=False,  # Don't load into memory
         )
+        print(f"   [load_dataset] returned in {time.perf_counter() - t:.1f}s", flush=True)
 
         # Ensure we have a Dataset object (not DatasetDict)
         if isinstance(dataset_raw, Dataset):
@@ -109,22 +131,31 @@ class MemoryEfficientDataset(TorchDataset):
                 n_rows=before,
             )
             keep_indices = _build_or_load_filter_index(self.dataset, cache_path, state)
+            t = time.perf_counter()
             # `select` with an int array creates a lightweight view over the underlying
             # Arrow file rather than materializing a new table per rank.
             self.dataset = self.dataset.select(keep_indices)
             print(
-                f"🔎 Subsample: kept {len(self.dataset):,}/{before:,} rows with non-empty V2Themes and V2Tone"
+                f"   [select] applied filter indices in {time.perf_counter() - t:.1f}s "
+                f"(rank={state.process_index})",
+                flush=True,
+            )
+            print(
+                f"🔎 Subsample: kept {len(self.dataset):,}/{before:,} rows with non-empty V2Themes and V2Tone",
+                flush=True,
             )
 
         # Remove columns we don't need to save memory (keeping group_uid for triplet formation)
+        t = time.perf_counter()
         columns_to_remove = ["source", "title", "html", "url", "date"]
         existing_columns = [
             col for col in columns_to_remove if col in self.dataset.column_names
         ]
         if existing_columns:
             self.dataset = self.dataset.remove_columns(existing_columns)
+        print(f"   [remove_columns] in {time.perf_counter() - t:.1f}s", flush=True)
 
-        print(f"✅ Memory-mapped dataset ready: {len(self.dataset):,} samples")
+        print(f"✅ Memory-mapped dataset ready: {len(self.dataset):,} samples", flush=True)
 
     def __len__(self):
         return len(self.dataset)
@@ -247,14 +278,28 @@ def build_or_load_group_index(
     state = PartialState()
 
     if state.is_main_process and not os.path.exists(cache_path):
-        print("   Building group_uid index (one-time)...")
+        print("   [group-index] Building (one-time)...", flush=True)
+        t0 = time.perf_counter()
+
+        t = time.perf_counter()
         arrow_col = dataset.dataset.data.column("group_uid")
-        group_uids = np.asarray(arrow_col.to_numpy(zero_copy_only=False))
+        encoded = pc.dictionary_encode(arrow_col)
+        codes = np.concatenate(
+            [np.asarray(chunk.indices) for chunk in encoded.chunks]
+        )
+        print(
+            f"   [group-index] dictionary_encode + concat in "
+            f"{time.perf_counter() - t:.1f}s ({len(codes):,} rows)",
+            flush=True,
+        )
 
-        order = np.argsort(group_uids, kind="stable")
-        sorted_uids = group_uids[order]
+        t = time.perf_counter()
+        order = np.argsort(codes, kind="stable")
+        sorted_uids = codes[order]
         sorted_indices = order.astype(np.int32, copy=False)
+        print(f"   [group-index] argsort in {time.perf_counter() - t:.1f}s", flush=True)
 
+        t = time.perf_counter()
         # Group boundaries: positions where sorted_uids changes.
         if len(sorted_uids) == 0:
             group_offsets = np.zeros(1, dtype=np.int64)
@@ -267,20 +312,29 @@ def build_or_load_group_index(
             group_offsets = np.concatenate([starts, np.array([len(sorted_uids)], dtype=np.int64)])
             counts = np.diff(group_offsets)
             multi_group_ids = np.flatnonzero(counts >= 2).astype(np.int64)
+        print(f"   [group-index] boundaries in {time.perf_counter() - t:.1f}s", flush=True)
 
+        t = time.perf_counter()
         np.savez(cache_path, sorted_indices=sorted_indices, group_offsets=group_offsets,
                  multi_group_ids=multi_group_ids)
+        print(f"   [group-index] np.savez in {time.perf_counter() - t:.1f}s", flush=True)
+
         print(
-            f"   Group index built: {len(group_offsets) - 1:,} groups total, "
+            f"   [group-index] DONE in {time.perf_counter() - t0:.1f}s — "
+            f"{len(group_offsets) - 1:,} groups total, "
             f"{len(multi_group_ids):,} multi-article groups, "
-            f"{int(np.diff(group_offsets)[multi_group_ids].sum()) if len(multi_group_ids) else 0:,} indices"
+            f"{int(np.diff(group_offsets)[multi_group_ids].sum()) if len(multi_group_ids) else 0:,} indices",
+            flush=True,
         )
 
-    # All non-main ranks wait here for rank 0 to finish writing the cache; once they
-    # proceed, they (and rank 0) mmap-load it so workers share the page cache rather
-    # than duplicating the index in each parent heap.
+    t_bar = time.perf_counter()
     state.wait_for_everyone()
-    print(f"   Loading cached group index from {cache_path} (mmap)")
+    print(
+        f"   [group-index] rank={state.process_index} barrier waited "
+        f"{time.perf_counter() - t_bar:.1f}s",
+        flush=True,
+    )
+    print(f"   Loading cached group index from {cache_path} (mmap)", flush=True)
     data = np.load(cache_path, mmap_mode="r")
     return data["sorted_indices"], data["group_offsets"], data["multi_group_ids"]
 
