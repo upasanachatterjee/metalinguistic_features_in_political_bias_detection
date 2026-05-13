@@ -411,9 +411,12 @@ class GroupBatchSampler(Sampler[List[int]]):
 
     def __iter__(self):
         n_multi = len(self.multi_group_ids)
+        print(f"   [GroupBatchSampler.__iter__] start n_multi={n_multi} len(self)={len(self)} id={id(self)}", flush=True)
         if n_multi == 0:
+            print("   [GroupBatchSampler.__iter__] early return: n_multi==0", flush=True)
             return
         k = min(self.num_groups, n_multi)
+        _yielded = 0
         for _ in range(len(self)):
             chosen = self.rng.choice(self.multi_group_ids, size=k, replace=False)
             batch: List[int] = []
@@ -429,6 +432,10 @@ class GroupBatchSampler(Sampler[List[int]]):
                 if len(batch) >= self.batch_size:
                     break
             yield batch[: self.batch_size]
+            _yielded += 1
+            if _yielded <= 3 or _yielded % 1000 == 0:
+                print(f"   [GroupBatchSampler.__iter__] yielded={_yielded}/{len(self)} id={id(self)}", flush=True)
+        print(f"   [GroupBatchSampler.__iter__] exhausted: yielded={_yielded}/{len(self)} id={id(self)}", flush=True)
 
     def __len__(self):
         return max(1, self._multi_total // self.batch_size)
