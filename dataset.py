@@ -272,8 +272,9 @@ def build_dataloaders(
             tok, args, mlm_dataset, **loader_params
         )
     if "triplet_story" in tasks:
+        story_loader_params = {**loader_params, "num_workers": 0, "prefetch_factor": None, "persistent_workers": False}
         dataloaders["triplet_story"] = build_lazy_story_triplet_dataloader(
-            tok, args, task_spec, mlm_dataset, **loader_params
+            tok, args, task_spec, mlm_dataset, **story_loader_params
         )
     if "multilabel" in tasks:
         dataloaders["multilabel"] = build_lazy_multilabel_dataloader(
