@@ -1,7 +1,8 @@
 import argparse
 import torch
 import torch.nn as nn
-from accelerate import Accelerator, DistributedDataParallelKwargs
+from datetime import timedelta
+from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.utils import set_seed
 from dataset import build_dataloaders
 from model import MultiTaskRoberta
@@ -27,8 +28,13 @@ set_seed(42)
 
 # --- Training prep ---
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+# Long timeout so rank-0-only setup (filter-index build, dataset download) doesn't
+# trip the default 10-min NCCL barrier on cold caches.
+pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
 accelerator = Accelerator(
-    gradient_accumulation_steps=1, project_dir=output_dir, kwargs_handlers=[ddp_kwargs]
+    gradient_accumulation_steps=1,
+    project_dir=output_dir,
+    kwargs_handlers=[ddp_kwargs, pg_kwargs],
 )
 
 args = cfg.train_args
