@@ -44,8 +44,10 @@ def _build_or_load_filter_index(
             # Works whether the column is string-typed (treat empty/whitespace as missing)
             # or numeric (just non-null). Operates on Arrow buffers — no Python list copy.
             if pa.types.is_string(col.type) or pa.types.is_large_string(col.type):
-                trimmed = pc.utf8_trim_whitespace(col)
-                len_ok = pc.greater(pc.utf8_length(trimmed), 0)
+                # Skip whitespace-trim: it allocates a full string-column copy
+                # (multi-GB for V2Themes at 5M rows). GDELT columns are either
+                # populated or null in practice, so length-on-original is enough.
+                len_ok = pc.greater(pc.utf8_length(col), 0)
                 return pc.and_(pc.is_valid(col), len_ok)
             return pc.is_valid(col)
 
