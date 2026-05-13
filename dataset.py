@@ -1,6 +1,9 @@
 import hashlib
 import os
 import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+from accelerate.state import PartialState
 from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader, Dataset as TorchDataset, Sampler
 from pretraining_utils import TaskSpec, TrainArgs, login_to_huggingface
@@ -15,12 +18,48 @@ from collators.regression_collator import RegressionCollator
 login_to_huggingface(os.getenv("hf_token"))
 
 
-def _has_themes_and_tone(ex: Dict[str, Any]) -> bool:
-    t = ex.get("V2Themes")
-    n = ex.get("V2Tone")
-    themes_ok = t is not None and str(t).strip() != ""
-    tone_ok = n is not None and str(n).strip() != ""
-    return themes_ok and tone_ok
+def _filter_index_cache_path(
+    cache_dir: str, dataset_name: str, split: str, n_rows: int
+) -> str:
+    key = f"filter|{dataset_name}|{split}|themes_and_tone|n={n_rows}"
+    h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(cache_dir, f"filter_index_{h}.npy")
+
+
+def _build_or_load_filter_index(
+    dataset_raw: Dataset, cache_path: str, state: PartialState
+) -> np.ndarray:
+    """Compute row indices where V2Themes and V2Tone are both non-empty.
+
+    Built once on rank 0 (scanning the two Arrow columns directly, avoiding the
+    per-rank `dataset.filter(...)` that materializes a fresh Arrow table on every
+    process), then mmap'd by all ranks.
+    """
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+
+    if state.is_main_process and not os.path.exists(cache_path):
+        print(f"   Building filter index (one-time) at {cache_path}")
+
+        def _nonempty_mask(col: pa.ChunkedArray) -> pa.ChunkedArray:
+            # Works whether the column is string-typed (treat empty/whitespace as missing)
+            # or numeric (just non-null). Operates on Arrow buffers — no Python list copy.
+            if pa.types.is_string(col.type) or pa.types.is_large_string(col.type):
+                trimmed = pc.utf8_trim_whitespace(col)
+                len_ok = pc.greater(pc.utf8_length(trimmed), 0)
+                return pc.and_(pc.is_valid(col), len_ok)
+            return pc.is_valid(col)
+
+        themes_ok = _nonempty_mask(dataset_raw.data.column("V2Themes"))
+        tone_ok = _nonempty_mask(dataset_raw.data.column("V2Tone"))
+        keep_mask = pc.and_(themes_ok, tone_ok)
+        # Combine chunks → single numpy bool array, then take positions.
+        keep_np = np.concatenate([np.asarray(chunk) for chunk in keep_mask.chunks])
+        indices = np.flatnonzero(keep_np).astype(np.int64)
+        np.save(cache_path, indices)
+        print(f"   Filter index built: kept {len(indices):,}/{len(dataset_raw):,} rows")
+
+    state.wait_for_everyone()
+    return np.load(cache_path, mmap_mode="r")
 
 
 class MemoryEfficientDataset(TorchDataset):
@@ -60,7 +99,17 @@ class MemoryEfficientDataset(TorchDataset):
 
         if require_nonempty_themes_and_tone:
             before = len(self.dataset)
-            self.dataset = self.dataset.filter(_has_themes_and_tone)
+            state = PartialState()
+            cache_path = _filter_index_cache_path(
+                cache_dir=cache_dir or "./cache",
+                dataset_name=dataset_name,
+                split=split,
+                n_rows=before,
+            )
+            keep_indices = _build_or_load_filter_index(self.dataset, cache_path, state)
+            # `select` with an int array creates a lightweight view over the underlying
+            # Arrow file rather than materializing a new table per rank.
+            self.dataset = self.dataset.select(keep_indices)
             print(
                 f"🔎 Subsample: kept {len(self.dataset):,}/{before:,} rows with non-empty V2Themes and V2Tone"
             )
@@ -125,11 +174,15 @@ def build_dataloaders(
 
     dataloaders: Dict[str, Any] = {}
 
+    # Keep per-rank worker fanout low. With 8 ranks, num_workers=8 across 4 loaders
+    # plus story_triplet's own workers can fork hundreds of children whose COW heaps
+    # plus pinned buffers overrun host RAM. Tokenization on roberta-base is cheap
+    # relative to fwd/bwd, so 2 workers per loader is plenty.
     loader_params = {
-        "num_workers": 8,
+        "num_workers": 2,
         "pin_memory": True,
-        "persistent_workers": True,
-        "prefetch_factor": 4,
+        "persistent_workers": False,
+        "prefetch_factor": 2,
     }
 
     print("   Creating lazy datasets...")
@@ -157,17 +210,8 @@ def build_dataloaders(
             tok, args, mlm_dataset, **loader_params
         )
     if "triplet_story" in tasks:
-        # Story-triplet batches are small and the collator is cheap; the dominant cost
-        # is forking workers off the parent heap. Keep this loader's worker fanout low
-        # to avoid COW-blowing past available RAM on large datasets.
-        story_loader_params = {
-            **loader_params,
-            "num_workers": 2,
-            "persistent_workers": False,
-            "prefetch_factor": 2,
-        }
         dataloaders["triplet_story"] = build_lazy_story_triplet_dataloader(
-            tok, args, task_spec, mlm_dataset, **story_loader_params
+            tok, args, task_spec, mlm_dataset, **loader_params
         )
     if "multilabel" in tasks:
         dataloaders["multilabel"] = build_lazy_multilabel_dataloader(
@@ -198,42 +242,43 @@ def build_or_load_group_index(
       multi_group_ids: int64[M]   indices into group_offsets for groups with count >= 2
     """
     os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    state = PartialState()
 
-    if os.path.exists(cache_path):
-        print(f"   Loading cached group index from {cache_path} (mmap)")
-        data = np.load(cache_path, mmap_mode="r")
-        return data["sorted_indices"], data["group_offsets"], data["multi_group_ids"]
+    if state.is_main_process and not os.path.exists(cache_path):
+        print("   Building group_uid index (one-time)...")
+        arrow_col = dataset.dataset.data.column("group_uid")
+        group_uids = np.asarray(arrow_col.to_numpy(zero_copy_only=False))
 
-    print("   Building group_uid index (one-time)...")
-    arrow_col = dataset.dataset.data.column("group_uid")
-    group_uids = np.asarray(arrow_col.to_numpy(zero_copy_only=False))
+        order = np.argsort(group_uids, kind="stable")
+        sorted_uids = group_uids[order]
+        sorted_indices = order.astype(np.int32, copy=False)
 
-    order = np.argsort(group_uids, kind="stable")
-    sorted_uids = group_uids[order]
-    sorted_indices = order.astype(np.int32, copy=False)
+        # Group boundaries: positions where sorted_uids changes.
+        if len(sorted_uids) == 0:
+            group_offsets = np.zeros(1, dtype=np.int64)
+            multi_group_ids = np.zeros(0, dtype=np.int64)
+        else:
+            change = np.empty(len(sorted_uids), dtype=bool)
+            change[0] = True
+            change[1:] = sorted_uids[1:] != sorted_uids[:-1]
+            starts = np.flatnonzero(change).astype(np.int64)
+            group_offsets = np.concatenate([starts, np.array([len(sorted_uids)], dtype=np.int64)])
+            counts = np.diff(group_offsets)
+            multi_group_ids = np.flatnonzero(counts >= 2).astype(np.int64)
 
-    # Group boundaries: positions where sorted_uids changes.
-    if len(sorted_uids) == 0:
-        group_offsets = np.zeros(1, dtype=np.int64)
-        multi_group_ids = np.zeros(0, dtype=np.int64)
-    else:
-        change = np.empty(len(sorted_uids), dtype=bool)
-        change[0] = True
-        change[1:] = sorted_uids[1:] != sorted_uids[:-1]
-        starts = np.flatnonzero(change).astype(np.int64)
-        group_offsets = np.concatenate([starts, np.array([len(sorted_uids)], dtype=np.int64)])
-        counts = np.diff(group_offsets)
-        multi_group_ids = np.flatnonzero(counts >= 2).astype(np.int64)
+        np.savez(cache_path, sorted_indices=sorted_indices, group_offsets=group_offsets,
+                 multi_group_ids=multi_group_ids)
+        print(
+            f"   Group index built: {len(group_offsets) - 1:,} groups total, "
+            f"{len(multi_group_ids):,} multi-article groups, "
+            f"{int(np.diff(group_offsets)[multi_group_ids].sum()) if len(multi_group_ids) else 0:,} indices"
+        )
 
-    np.savez(cache_path, sorted_indices=sorted_indices, group_offsets=group_offsets,
-             multi_group_ids=multi_group_ids)
-    print(
-        f"   Group index built: {len(group_offsets) - 1:,} groups total, "
-        f"{len(multi_group_ids):,} multi-article groups, "
-        f"{int(np.diff(group_offsets)[multi_group_ids].sum()) if len(multi_group_ids) else 0:,} indices"
-    )
-
-    # Re-open mmap so workers share the page cache rather than the parent heap.
+    # All non-main ranks wait here for rank 0 to finish writing the cache; once they
+    # proceed, they (and rank 0) mmap-load it so workers share the page cache rather
+    # than duplicating the index in each parent heap.
+    state.wait_for_everyone()
+    print(f"   Loading cached group index from {cache_path} (mmap)")
     data = np.load(cache_path, mmap_mode="r")
     return data["sorted_indices"], data["group_offsets"], data["multi_group_ids"]
 

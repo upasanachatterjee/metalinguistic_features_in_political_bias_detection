@@ -25,7 +25,7 @@ class TaskSpec:
     max_triplet_samples: int = 16
     # Group-aware sampler for the story triplet objective
     group_batch_num_groups: int = 8
-    group_batch_per_group: int = 4
+    group_batch_per_group: int = 3
     # Subsampling: drop rows where V2Themes or V2Tone is missing/empty
     require_nonempty_themes_and_tone: bool = False
     # Directory for cached group-index artifacts (one-time build, mmap'd on reuse)

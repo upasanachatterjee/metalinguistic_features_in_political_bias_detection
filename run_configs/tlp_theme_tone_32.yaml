@@ -1,7 +1,7 @@
 output_dir: ./subsample_tlp_story_ideo_mlm_mtl_ckpt_32_gpu_4090_48gb
 tasks: [triplet_ideology, triplet_story, mlm, tone, themes]
 theme_count: 2000
-tone_count: 2
+tone_count: 1
 base_lr: 5.0e-5
 train_args:
   num_epochs: 1
