@@ -272,9 +272,8 @@ def build_dataloaders(
             tok, args, mlm_dataset, **loader_params
         )
     if "triplet_story" in tasks:
-        story_loader_params = {**loader_params, "num_workers": 0, "prefetch_factor": None, "persistent_workers": False}
         dataloaders["triplet_story"] = build_lazy_story_triplet_dataloader(
-            tok, args, task_spec, mlm_dataset, **story_loader_params
+            tok, args, task_spec, mlm_dataset, **loader_params
         )
     if "multilabel" in tasks:
         dataloaders["multilabel"] = build_lazy_multilabel_dataloader(
@@ -389,6 +388,8 @@ class GroupBatchSampler(Sampler[List[int]]):
         num_groups: int,
         per_group: int,
         seed: Optional[int] = None,
+        num_replicas: int = 1,
+        rank: int = 0,
     ):
         self.sorted_indices = sorted_indices
         self.group_offsets = group_offsets
@@ -397,7 +398,11 @@ class GroupBatchSampler(Sampler[List[int]]):
         self.num_groups = num_groups
         self.per_group = per_group
         self.seed = seed
-        self.rng = np.random.default_rng(seed)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        # Distinct seed per rank so each rank picks different groups.
+        rank_seed = None if seed is None else seed + rank
+        self.rng = np.random.default_rng(rank_seed)
 
         if len(multi_group_ids):
             sizes = group_offsets[multi_group_ids + 1] - group_offsets[multi_group_ids]
@@ -405,18 +410,15 @@ class GroupBatchSampler(Sampler[List[int]]):
         else:
             self._multi_total = 0
         print(
-            f"   GroupBatchSampler: {len(multi_group_ids):,} multi-article groups, "
-            f"{self._multi_total:,} indices, ~{len(self):,} batches/epoch"
+            f"   GroupBatchSampler[rank={rank}/{num_replicas}]: {len(multi_group_ids):,} multi-article groups, "
+            f"{self._multi_total:,} indices, ~{len(self):,} batches/epoch (this rank)"
         )
 
     def __iter__(self):
         n_multi = len(self.multi_group_ids)
-        print(f"   [GroupBatchSampler.__iter__] start n_multi={n_multi} len(self)={len(self)} id={id(self)}", flush=True)
         if n_multi == 0:
-            print("   [GroupBatchSampler.__iter__] early return: n_multi==0", flush=True)
             return
         k = min(self.num_groups, n_multi)
-        _yielded = 0
         for _ in range(len(self)):
             chosen = self.rng.choice(self.multi_group_ids, size=k, replace=False)
             batch: List[int] = []
@@ -432,13 +434,11 @@ class GroupBatchSampler(Sampler[List[int]]):
                 if len(batch) >= self.batch_size:
                     break
             yield batch[: self.batch_size]
-            _yielded += 1
-            if _yielded <= 3 or _yielded % 1000 == 0:
-                print(f"   [GroupBatchSampler.__iter__] yielded={_yielded}/{len(self)} id={id(self)}", flush=True)
-        print(f"   [GroupBatchSampler.__iter__] exhausted: yielded={_yielded}/{len(self)} id={id(self)}", flush=True)
 
     def __len__(self):
-        return max(1, self._multi_total // self.batch_size)
+        # Per-rank length: each rank yields its own slice.
+        total = max(1, self._multi_total // self.batch_size)
+        return max(1, total // self.num_replicas)
 
     def __deepcopy__(self, memo):
         # Index arrays are read-only (mmap'd); share by reference so accelerator.prepare's
@@ -451,8 +451,11 @@ class GroupBatchSampler(Sampler[List[int]]):
         new.num_groups = self.num_groups
         new.per_group = self.per_group
         new.seed = self.seed
+        new.num_replicas = self.num_replicas
+        new.rank = self.rank
         new._multi_total = self._multi_total
-        new.rng = np.random.default_rng(self.seed)
+        rank_seed = None if self.seed is None else self.seed + self.rank
+        new.rng = np.random.default_rng(rank_seed)
         return new
 
 
@@ -523,6 +526,7 @@ def build_lazy_story_triplet_dataloader(
     sorted_indices, group_offsets, multi_group_ids = build_or_load_group_index(
         dataset, cache_path
     )
+    state = PartialState()
     sampler = GroupBatchSampler(
         sorted_indices=sorted_indices,
         group_offsets=group_offsets,
@@ -530,6 +534,9 @@ def build_lazy_story_triplet_dataloader(
         batch_size=args.batch_size,
         num_groups=spec.group_batch_num_groups,
         per_group=spec.group_batch_per_group,
+        seed=getattr(spec, "seed", 0),
+        num_replicas=state.num_processes,
+        rank=state.process_index,
     )
     collator = StoryTripletCollator(triplet_downsample_size=spec.max_triplet_samples)
     return DataLoader(

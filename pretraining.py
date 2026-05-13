@@ -128,13 +128,21 @@ scheduler = get_linear_schedule_with_warmup(
 )
 
 print("\nPreparing objects with Accelerator...")
-# Prepare dataloaders for distributed training as well
+# Prepare dataloaders for distributed training as well.
+# `triplet_story` uses a custom rank-aware GroupBatchSampler; passing it
+# through accelerator.prepare would wrap it in BatchSamplerShard which
+# (a) iterates the full inner sampler on every rank, and (b) trips a bug
+# in DataLoaderShard.__iter__ when its first next() raises StopIteration.
+# Skip prepare for that loader and move batches to device manually.
+SKIP_PREPARE = {"triplet_story"}
 prepared_dataloaders = {}
 for name, dl in dataloaders.items():
-    if dl is not None:
-        prepared_dataloaders[name] = accelerator.prepare(dl)
-    else:
+    if dl is None:
         prepared_dataloaders[name] = None
+    elif name in SKIP_PREPARE:
+        prepared_dataloaders[name] = dl
+    else:
+        prepared_dataloaders[name] = accelerator.prepare(dl)
 
 (model, scheduler, optimizer) = accelerator.prepare(model, scheduler, optimizer)
 dataloaders = prepared_dataloaders  # Use prepared dataloaders
@@ -297,14 +305,15 @@ while epoch < args.num_epochs:
                             }
                         )
                     elif task_name == "triplet_story":
+                        dev = accelerator.device
                         combined_batch.update(
                             {
-                                "story_a_ids": batch["a_ids"],
-                                "story_a_mask": batch["a_mask"],
-                                "story_p_ids": batch["p_ids"],
-                                "story_p_mask": batch["p_mask"],
-                                "story_n_ids": batch["n_ids"],
-                                "story_n_mask": batch["n_mask"],
+                                "story_a_ids": batch["a_ids"].to(dev, non_blocking=True),
+                                "story_a_mask": batch["a_mask"].to(dev, non_blocking=True),
+                                "story_p_ids": batch["p_ids"].to(dev, non_blocking=True),
+                                "story_p_mask": batch["p_mask"].to(dev, non_blocking=True),
+                                "story_n_ids": batch["n_ids"].to(dev, non_blocking=True),
+                                "story_n_mask": batch["n_mask"].to(dev, non_blocking=True),
                             }
                         )
                     elif task_name == "themes":
