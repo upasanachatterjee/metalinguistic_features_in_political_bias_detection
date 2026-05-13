@@ -1,9 +1,10 @@
-import random
+import hashlib
+import os
+import numpy as np
 from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader, Dataset as TorchDataset, Sampler
-import os
 from pretraining_utils import TaskSpec, TrainArgs, login_to_huggingface
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.tokenization_utils import PreTrainedTokenizer
 from collators.triplet_collator import TripletDataCollator
@@ -137,6 +138,7 @@ def build_dataloaders(
         split=task_spec.split,
         text_col=task_spec.text_col,
         tokenizer=tok,
+        cache_dir=task_spec.group_index_cache_dir,
         require_nonempty_themes_and_tone=task_spec.require_nonempty_themes_and_tone,
     )
 
@@ -155,8 +157,17 @@ def build_dataloaders(
             tok, args, mlm_dataset, **loader_params
         )
     if "triplet_story" in tasks:
+        # Story-triplet batches are small and the collator is cheap; the dominant cost
+        # is forking workers off the parent heap. Keep this loader's worker fanout low
+        # to avoid COW-blowing past available RAM on large datasets.
+        story_loader_params = {
+            **loader_params,
+            "num_workers": 2,
+            "persistent_workers": False,
+            "prefetch_factor": 2,
+        }
         dataloaders["triplet_story"] = build_lazy_story_triplet_dataloader(
-            tok, args, task_spec, mlm_dataset, **loader_params
+            tok, args, task_spec, mlm_dataset, **story_loader_params
         )
     if "multilabel" in tasks:
         dataloaders["multilabel"] = build_lazy_multilabel_dataloader(
@@ -167,8 +178,72 @@ def build_dataloaders(
     return dataloaders
 
 
+def _group_index_cache_path(
+    cache_dir: str, dataset_name: str, split: str, filtered: bool, n_rows: int
+) -> str:
+    key = f"{dataset_name}|{split}|filtered={filtered}|n={n_rows}"
+    h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(cache_dir, f"group_index_{h}.npz")
+
+
+def build_or_load_group_index(
+    dataset: "MemoryEfficientDataset",
+    cache_path: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build or mmap-load a compact group index for `group_uid`.
+
+    Returns:
+      sorted_indices : int32[N]   row indices grouped contiguously by group_uid
+      group_offsets  : int64[G+1] start positions per unique group
+      multi_group_ids: int64[M]   indices into group_offsets for groups with count >= 2
+    """
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+
+    if os.path.exists(cache_path):
+        print(f"   Loading cached group index from {cache_path} (mmap)")
+        data = np.load(cache_path, mmap_mode="r")
+        return data["sorted_indices"], data["group_offsets"], data["multi_group_ids"]
+
+    print("   Building group_uid index (one-time)...")
+    arrow_col = dataset.dataset.data.column("group_uid")
+    group_uids = np.asarray(arrow_col.to_numpy(zero_copy_only=False))
+
+    order = np.argsort(group_uids, kind="stable")
+    sorted_uids = group_uids[order]
+    sorted_indices = order.astype(np.int32, copy=False)
+
+    # Group boundaries: positions where sorted_uids changes.
+    if len(sorted_uids) == 0:
+        group_offsets = np.zeros(1, dtype=np.int64)
+        multi_group_ids = np.zeros(0, dtype=np.int64)
+    else:
+        change = np.empty(len(sorted_uids), dtype=bool)
+        change[0] = True
+        change[1:] = sorted_uids[1:] != sorted_uids[:-1]
+        starts = np.flatnonzero(change).astype(np.int64)
+        group_offsets = np.concatenate([starts, np.array([len(sorted_uids)], dtype=np.int64)])
+        counts = np.diff(group_offsets)
+        multi_group_ids = np.flatnonzero(counts >= 2).astype(np.int64)
+
+    np.savez(cache_path, sorted_indices=sorted_indices, group_offsets=group_offsets,
+             multi_group_ids=multi_group_ids)
+    print(
+        f"   Group index built: {len(group_offsets) - 1:,} groups total, "
+        f"{len(multi_group_ids):,} multi-article groups, "
+        f"{int(np.diff(group_offsets)[multi_group_ids].sum()) if len(multi_group_ids) else 0:,} indices"
+    )
+
+    # Re-open mmap so workers share the page cache rather than the parent heap.
+    data = np.load(cache_path, mmap_mode="r")
+    return data["sorted_indices"], data["group_offsets"], data["multi_group_ids"]
+
+
 class GroupBatchSampler(Sampler[List[int]]):
     """Yields batches of indices that contain multiple articles sharing the same group_uid.
+
+    Backed by a compact NumPy index (mmap'd from disk) rather than a Python dict, so the
+    sampler stays small in RAM, cheap to deepcopy (Accelerate's prepare path), and shares
+    pages across forked DataLoader workers.
 
     Each batch is composed of `num_groups` randomly chosen multi-article groups, each
     contributing up to `per_group` indices, truncated to `batch_size`.
@@ -176,48 +251,71 @@ class GroupBatchSampler(Sampler[List[int]]):
 
     def __init__(
         self,
-        dataset: "MemoryEfficientDataset",
+        sorted_indices: np.ndarray,
+        group_offsets: np.ndarray,
+        multi_group_ids: np.ndarray,
         batch_size: int,
         num_groups: int,
         per_group: int,
         seed: Optional[int] = None,
     ):
+        self.sorted_indices = sorted_indices
+        self.group_offsets = group_offsets
+        self.multi_group_ids = multi_group_ids
         self.batch_size = batch_size
         self.num_groups = num_groups
         self.per_group = per_group
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
 
-        print("   Building group_uid index for GroupBatchSampler...")
-        group_uids = dataset.dataset["group_uid"]
-        groups: Dict[Any, List[int]] = {}
-        for i, g in enumerate(group_uids):
-            groups.setdefault(g, []).append(i)
-        self.groups = {g: idxs for g, idxs in groups.items() if len(idxs) >= 2}
-        self.group_keys = list(self.groups.keys())
-        self._multi_total = sum(len(v) for v in self.groups.values())
-        self.rng = random.Random(seed)
+        if len(multi_group_ids):
+            sizes = group_offsets[multi_group_ids + 1] - group_offsets[multi_group_ids]
+            self._multi_total = int(sizes.sum())
+        else:
+            self._multi_total = 0
         print(
-            f"   GroupBatchSampler: {len(self.group_keys):,} multi-article groups, "
+            f"   GroupBatchSampler: {len(multi_group_ids):,} multi-article groups, "
             f"{self._multi_total:,} indices, ~{len(self):,} batches/epoch"
         )
 
     def __iter__(self):
+        n_multi = len(self.multi_group_ids)
+        if n_multi == 0:
+            return
+        k = min(self.num_groups, n_multi)
         for _ in range(len(self)):
-            chosen = self.rng.sample(
-                self.group_keys, k=min(self.num_groups, len(self.group_keys))
-            )
+            chosen = self.rng.choice(self.multi_group_ids, size=k, replace=False)
             batch: List[int] = []
             for g in chosen:
-                items = self.groups[g]
-                if len(items) <= self.per_group:
-                    batch.extend(items)
+                start = int(self.group_offsets[g])
+                end = int(self.group_offsets[g + 1])
+                size = end - start
+                if size <= self.per_group:
+                    batch.extend(int(x) for x in self.sorted_indices[start:end])
                 else:
-                    batch.extend(self.rng.sample(items, k=self.per_group))
+                    picks = self.rng.choice(size, size=self.per_group, replace=False)
+                    batch.extend(int(self.sorted_indices[start + p]) for p in picks)
                 if len(batch) >= self.batch_size:
                     break
             yield batch[: self.batch_size]
 
     def __len__(self):
         return max(1, self._multi_total // self.batch_size)
+
+    def __deepcopy__(self, memo):
+        # Index arrays are read-only (mmap'd); share by reference so accelerator.prepare's
+        # deepcopy doesn't traverse millions of entries or duplicate memory.
+        new = GroupBatchSampler.__new__(GroupBatchSampler)
+        new.sorted_indices = self.sorted_indices
+        new.group_offsets = self.group_offsets
+        new.multi_group_ids = self.multi_group_ids
+        new.batch_size = self.batch_size
+        new.num_groups = self.num_groups
+        new.per_group = self.per_group
+        new.seed = self.seed
+        new._multi_total = self._multi_total
+        new.rng = np.random.default_rng(self.seed)
+        return new
 
 
 # ------------------------------
@@ -277,8 +375,20 @@ def build_lazy_story_triplet_dataloader(
     **loader_kwargs,
 ) -> DataLoader:
     """Build story-triplet dataloader using a group-aware batch sampler."""
+    cache_path = _group_index_cache_path(
+        cache_dir=spec.group_index_cache_dir,
+        dataset_name=spec.dataset_name,
+        split=spec.split,
+        filtered=spec.require_nonempty_themes_and_tone,
+        n_rows=len(dataset),
+    )
+    sorted_indices, group_offsets, multi_group_ids = build_or_load_group_index(
+        dataset, cache_path
+    )
     sampler = GroupBatchSampler(
-        dataset,
+        sorted_indices=sorted_indices,
+        group_offsets=group_offsets,
+        multi_group_ids=multi_group_ids,
         batch_size=args.batch_size,
         num_groups=spec.group_batch_num_groups,
         per_group=spec.group_batch_per_group,

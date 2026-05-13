@@ -4,7 +4,7 @@ theme_count: 2000
 tone_count: 1
 base_lr: 5.0e-5
 train_args:
-  num_epochs: 3
+  num_epochs: 1
   batch_size: 32
   warmup_ratio: 0.06
   log_every: 5000

@@ -28,6 +28,8 @@ class TaskSpec:
     group_batch_per_group: int = 4
     # Subsampling: drop rows where V2Themes or V2Tone is missing/empty
     require_nonempty_themes_and_tone: bool = False
+    # Directory for cached group-index artifacts (one-time build, mmap'd on reuse)
+    group_index_cache_dir: str = "./cache"
 
 
 @dataclass
