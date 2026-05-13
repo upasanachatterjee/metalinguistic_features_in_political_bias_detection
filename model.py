@@ -144,7 +144,7 @@ class MultiTaskRoberta(nn.Module):
             total_loss += bias_loss
             outputs["bias_loss"] = bias_loss
             outputs["bias_logits"] = bias_logits
-        elif "labels" in kwargs and "input_ids" in kwargs and self.num_bias_classes > 0:
+        elif "labels" in kwargs and "input_ids" in kwargs and self.num_bias_classes and self.num_bias_classes > 0:
             raise ValueError(
                 "num_bias_classes > 0 but no bias_labels or bias_input_ids found"
             )

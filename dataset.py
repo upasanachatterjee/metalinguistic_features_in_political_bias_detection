@@ -577,7 +577,7 @@ def build_lazy_regression_dataloader(
     **loader_kwargs,
 ) -> Optional[DataLoader]:
     """Build regression dataloader with lazy loading."""
-    collator = RegressionCollator(num_tones=spec.tones_count)
+    collator = RegressionCollator(output_size=spec.tones_count)
 
     return DataLoader(
         dataset,

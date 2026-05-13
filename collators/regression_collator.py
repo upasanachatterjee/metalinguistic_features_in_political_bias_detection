@@ -51,7 +51,7 @@ class RegressionCollator:
 
 
 def parse_regression_values(
-    row_string: Optional[str], output_size: int = 2
+    row_string: Optional[str], output_size: int = 1
 ) -> Optional[List[float]]:
     """
     Parse comma-separated string and return the first output_size values as floats.
