@@ -154,6 +154,19 @@ class MemoryEfficientDataset(TorchDataset):
                 f"{time.perf_counter() - t:.1f}s",
                 flush=True,
             )
+            # Materialize the selection into the underlying arrow table so that
+            # `self.dataset.data.column(...)` reflects the filtered view. Without
+            # this, callers reading `.data` directly (e.g. the group-index builder)
+            # see the unfiltered table and produce row indices that overflow the
+            # filtered dataset's __getitem__ bounds.
+            t = time.perf_counter()
+            with state.main_process_first():
+                self.dataset = self.dataset.flatten_indices()
+            print(
+                f"   [flatten_indices] rank={state.process_index} in "
+                f"{time.perf_counter() - t:.1f}s",
+                flush=True,
+            )
             if state.is_main_process:
                 print(
                     f"🔎 Subsample: kept {len(self.dataset):,}/{before:,} rows "
