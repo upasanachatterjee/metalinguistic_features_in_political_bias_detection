@@ -12,7 +12,6 @@ import time
 from transformers.optimization import get_linear_schedule_with_warmup
 import os
 
-# Environment setup (wandb removed)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Avoid tokenizer warnings
 
 parser = argparse.ArgumentParser()
@@ -23,7 +22,7 @@ cfg = load_run_config(cli.config)
 output_dir = cfg.output_dir
 os.makedirs(output_dir, exist_ok=True)
 
-# Set random seed for reproducibility
+# Set random seed
 set_seed(42)
 
 # --- Training prep ---
@@ -66,13 +65,13 @@ model = MultiTaskRoberta(
 model.to(accelerator.device)
 print(f"Model initialized: {model.__class__.__name__}")
 
-# Reduce activation memory: re-compute intermediate activations during backward
-# instead of storing them. Trades ~20-30% step time for ~5-10x lower activation
-# memory. Required for batch_size=32 with both triplet tasks active.
-model.backbone.config.use_cache = False
-model.gradient_checkpointing_enable()
-if accelerator.is_main_process:
-    print("Gradient checkpointing enabled on backbone")
+# # Reduce activation memory: re-compute intermediate activations during backward
+# # instead of storing them. Trades ~20-30% step time for ~5-10x lower activation
+# # memory. Required for batch_size=32 with both triplet tasks active.
+# model.backbone.config.use_cache = False
+# model.gradient_checkpointing_enable()
+# if accelerator.is_main_process:
+#     print("Gradient checkpointing enabled on backbone")
 
 effective_batch_size = (
     args.batch_size
@@ -205,8 +204,8 @@ TASK_TO_DL = {
     "triplet_ideology": "triplet_ideology",
     "triplet_story": "triplet_story",
     "mlm": "mlm",
-    "tone": "regression",
-    "themes": "multilabel",
+    "tone": "tone",
+    "themes": "themes",
 }
 
 for task_name, dl_name in TASK_TO_DL.items():
@@ -444,13 +443,10 @@ while epoch < args.num_epochs:
 
                 print(f"  {log_entry}")
                 print(
-                    f"    Elapsed: {elapsed_str} | ETC: {eta_str} | Completion: {completion_str}"
+                    f"    Elapsed: {elapsed_str} | Epoch {epoch + 1}: {epoch_progress_pct:.1f}% | Epoch ETC: {epoch_eta_str}"
                 )
                 print(
                     f"    Speed: {steps_per_second:.2f} steps/s | {samples_per_second:.0f} samples/s"
-                )
-                print(
-                    f"    Epoch {epoch + 1}: {epoch_progress_pct:.1f}% | Epoch ETC: {epoch_eta_str}"
                 )
                 if task_losses:
                     task_loss_str = " | ".join(

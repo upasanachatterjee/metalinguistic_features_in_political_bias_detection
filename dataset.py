@@ -16,7 +16,10 @@ from collators.story_collator import StoryTripletCollator
 from collators.multi_label_collator import MultiLabelCollator
 from collators.regression_collator import RegressionCollator
 
-login_to_huggingface(os.getenv("hf_token"))
+_hf_login_state = PartialState()
+if _hf_login_state.is_main_process:
+    login_to_huggingface(os.getenv("hf_token"))
+_hf_login_state.wait_for_everyone()
 
 
 def _filter_index_cache_path(
@@ -220,7 +223,7 @@ def build_dataloaders(
     Build dataloaders with lazy loading - no pre-tokenization or RAM loading.
 
     Pass `tasks_to_build` to skip loaders not needed for the current run. Task names:
-      - "mlm", "regression", "multilabel"
+      - "mlm", "regression", "themes"
       - "triplet_ideology" (random sampler, ideology mining)
       - "triplet_story" (group-aware sampler, story mining)
     Legacy "triplet" is treated as "triplet_ideology".
@@ -228,7 +231,7 @@ def build_dataloaders(
     print("🚀 Building memory-efficient dataloaders with lazy loading...")
 
     tasks = set(tasks_to_build) if tasks_to_build is not None else {
-        "mlm", "regression", "triplet_ideology", "multilabel",
+        "mlm", "tone", "triplet_ideology", "themes",
     }
     if "triplet" in tasks:
         tasks.discard("triplet")
@@ -263,8 +266,8 @@ def build_dataloaders(
         dataloaders["mlm"] = build_lazy_mlm_dataloader(
             tok, args, mlm_dataset, **loader_params
         )
-    if "regression" in tasks:
-        dataloaders["regression"] = build_lazy_regression_dataloader(
+    if "tone" in tasks:
+        dataloaders["tone"] = build_lazy_regression_dataloader(
             tok, task_spec, args, mlm_dataset, **loader_params
         )
     if "triplet_ideology" in tasks:
@@ -275,8 +278,8 @@ def build_dataloaders(
         dataloaders["triplet_story"] = build_lazy_story_triplet_dataloader(
             tok, args, task_spec, mlm_dataset, **loader_params
         )
-    if "multilabel" in tasks:
-        dataloaders["multilabel"] = build_lazy_multilabel_dataloader(
+    if "themes" in tasks:
+        dataloaders["themes"] = build_lazy_multilabel_dataloader(
             tok, task_spec, args, mlm_dataset, **loader_params
         )
 
