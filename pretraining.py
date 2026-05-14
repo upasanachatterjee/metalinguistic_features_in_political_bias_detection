@@ -66,6 +66,14 @@ model = MultiTaskRoberta(
 model.to(accelerator.device)
 print(f"Model initialized: {model.__class__.__name__}")
 
+# Reduce activation memory: re-compute intermediate activations during backward
+# instead of storing them. Trades ~20-30% step time for ~5-10x lower activation
+# memory. Required for batch_size=32 with both triplet tasks active.
+model.backbone.config.use_cache = False
+model.gradient_checkpointing_enable()
+if accelerator.is_main_process:
+    print("Gradient checkpointing enabled on backbone")
+
 effective_batch_size = (
     args.batch_size
     * accelerator.num_processes
@@ -97,7 +105,14 @@ steps_per_epoch = {}
 for task_name, dataloader in dataloaders.items():
     if dataloader is not None:
         dataset_sizes[task_name] = len(dataloader.dataset)
-        steps_per_epoch[task_name] = len(dataloader)
+        raw_len = len(dataloader)
+        # triplet_story's sampler is already rank-aware, so len() returns
+        # per-rank batches. Scale back up so max_steps_per_epoch's later
+        # division by num_processes treats it on equal footing with the
+        # other loaders (which still report their global length here).
+        if task_name == "triplet_story":
+            raw_len *= accelerator.num_processes
+        steps_per_epoch[task_name] = raw_len
         print(
             f"   {task_name:12s}: {dataset_sizes[task_name]:,} samples, {steps_per_epoch[task_name]:,} steps per epoch"
         )
