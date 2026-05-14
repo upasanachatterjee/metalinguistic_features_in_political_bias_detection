@@ -64,13 +64,16 @@ model = MultiTaskRoberta(
 model.to(accelerator.device)
 print(f"Model initialized: {model.__class__.__name__}")
 
-# # Reduce activation memory: re-compute intermediate activations during backward
-# # instead of storing them. Trades ~20-30% step time for ~5-10x lower activation
-# # memory. Required for batch_size=32 with both triplet tasks active.
-# model.backbone.config.use_cache = False
-# model.gradient_checkpointing_enable()
-# if accelerator.is_main_process:
-#     print("Gradient checkpointing enabled on backbone")
+# Reduce activation memory: re-compute intermediate activations during backward
+# instead of storing them. Trades ~20-30% step time for ~5-10x lower activation
+# memory. Required for batch_size=32 with both triplet tasks active.
+# Uses non-reentrant checkpointing (see model.gradient_checkpointing_enable)
+# because reentrant checkpointing trips DDP's "marked ready twice" assertion
+# when the shared backbone is forwarded multiple times per step.
+model.backbone.config.use_cache = False
+model.gradient_checkpointing_enable()
+if accelerator.is_main_process:
+    print("Gradient checkpointing enabled on backbone (use_reentrant=False)")
 
 effective_batch_size = (
     args.batch_size
@@ -230,7 +233,7 @@ with open(log_file, "w") as f:
     f.write(f"Total Steps: {TOTAL_STEPS:,}\n")
     f.write(f"GPUs: {accelerator.num_processes}\n")
     f.write(f"Available Tasks: {available_tasks}\n")
-    f.write(f"Using num themes: {theme_count} and num tones: {tone_count}\n")
+    f.write(f"Using num themes: {theme_count} and num tones: 1\n")
     f.write(f"Num triplets per batch: {task_spec.max_triplet_samples}\n")
     f.write(f"Subsampling for themes/tone: {subsample}\n")
     f.write(f"Batch size: {args.batch_size}\n")
