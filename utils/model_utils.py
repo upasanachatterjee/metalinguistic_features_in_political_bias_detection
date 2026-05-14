@@ -18,8 +18,8 @@ def load_model(model):
     else:
         print("Attempting to load as MultiTaskRoberta...")
         try:
-            themes = 1000 if "1000" in model else 2000
-            tones = 1 if "tone_tone" in model else 2
+            themes = 1000
+            tones = 1
             print(f"loading w num_themes={themes}, num_tones={tones}")
 
             checkpoint = torch.load(model, map_location="cpu")

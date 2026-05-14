@@ -21,7 +21,6 @@ class TaskSpec:
     themes_path: Optional[str] = None
     # Regression
     regression_col: Optional[str] = "V2Tone"  # column containing float target(s)
-    tones_count: int = 2
     max_triplet_samples: int = 16
     # Group-aware sampler for the story triplet objective
     group_batch_num_groups: int = 8

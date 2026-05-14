@@ -24,7 +24,7 @@ class ClassificationHead(nn.Module):
 
 class MultiTaskRoberta(nn.Module):
     def __init__(
-        self, name="roberta-base", num_tones=2, num_themes=2000, num_bias_classes=None
+        self, name="roberta-base", num_tones=1, num_themes=2000, num_bias_classes=None
     ):
         super().__init__()
         # Single backbone model

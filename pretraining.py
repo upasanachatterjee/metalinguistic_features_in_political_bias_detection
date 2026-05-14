@@ -56,11 +56,10 @@ if accelerator.is_main_process:
 print(f"TrainArgs loaded: {args.num_epochs} epochs, {args.model_name}")
 
 theme_count = cfg.theme_count
-tone_count = cfg.tone_count
 subsample = cfg.task_spec.require_nonempty_themes_and_tone
 
 model = MultiTaskRoberta(
-    num_themes=theme_count, num_tones=tone_count, num_bias_classes=None
+    num_themes=theme_count, num_tones=1, num_bias_classes=None
 )
 model.to(accelerator.device)
 print(f"Model initialized: {model.__class__.__name__}")
@@ -445,9 +444,6 @@ while epoch < args.num_epochs:
                 print(
                     f"    Elapsed: {elapsed_str} | Epoch {epoch + 1}: {epoch_progress_pct:.1f}% | Epoch ETC: {epoch_eta_str}"
                 )
-                print(
-                    f"    Speed: {steps_per_second:.2f} steps/s | {samples_per_second:.0f} samples/s"
-                )
                 if task_losses:
                     task_loss_str = " | ".join(
                         [f"{k}: {v:.4f}" for k, v in task_losses.items()]
@@ -458,13 +454,7 @@ while epoch < args.num_epochs:
                 with open(log_file, "a") as f:
                     f.write(f"{log_entry}\n")
                     f.write(
-                        f"  Timing: Elapsed={elapsed_str}, ETC={eta_str}, Completion={completion_str}\n"
-                    )
-                    f.write(
-                        f"  Speed: {steps_per_second:.2f} steps/s, {samples_per_second:.0f} samples/s\n"
-                    )
-                    f.write(
-                        f"  Epoch: {epoch + 1} ({epoch_progress_pct:.1f}%), Epoch ETC: {epoch_eta_str}\n"
+                        f"  Timing: Elapsed={elapsed_str}, Epoch: {epoch + 1} ({epoch_progress_pct:.1f}%), Epoch ETC: {epoch_eta_str}\n"
                     )
                     f.write("\n")
 
