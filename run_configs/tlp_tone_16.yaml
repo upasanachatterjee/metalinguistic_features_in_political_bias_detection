@@ -1,4 +1,4 @@
-output_dir: ./subsample_tlp_story_ideo_mlm_mtl_ckpt_32_gpu_4090_48gb
+output_dir: ./subsample_tlp_story_ideo_mlm_mtl_ckpt_16_gpu_4090_48gb
 tasks: [triplet_ideology, triplet_story, mlm, tone]
 theme_count: 2000
 tone_count: 1
