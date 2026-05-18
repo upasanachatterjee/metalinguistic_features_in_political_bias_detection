@@ -61,6 +61,19 @@ subsample = cfg.task_spec.require_nonempty_themes_and_tone
 model = MultiTaskRoberta(
     num_themes=theme_count, num_tones=1, num_bias_classes=None
 )
+
+if cfg.init_from_checkpoint:
+    if accelerator.is_main_process:
+        print(f"Loading initial weights from {cfg.init_from_checkpoint}")
+    ckpt = torch.load(cfg.init_from_checkpoint, map_location="cpu", weights_only=False)
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if accelerator.is_main_process:
+        if missing:
+            print(f"  Missing keys: {len(missing)} (first 5: {missing[:5]})")
+        if unexpected:
+            print(f"  Unexpected keys: {len(unexpected)} (first 5: {unexpected[:5]})")
+        print("  Checkpoint loaded")
+
 model.to(accelerator.device)
 print(f"Model initialized: {model.__class__.__name__}")
 
@@ -229,6 +242,8 @@ with open(log_file, "w") as f:
     f.write("=" * 50 + "\n")
     f.write(f"Start Time: {__import__('datetime').datetime.now()}\n")
     f.write(f"Model: {args.model_name}\n")
+    if cfg.init_from_checkpoint:
+        f.write(f"Init from checkpoint: {cfg.init_from_checkpoint}\n")
     f.write(f"Dataset: {task_spec.dataset_name}\n")
     f.write(f"Total Steps: {TOTAL_STEPS:,}\n")
     f.write(f"GPUs: {accelerator.num_processes}\n")

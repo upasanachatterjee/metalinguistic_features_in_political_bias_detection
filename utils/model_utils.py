@@ -18,9 +18,8 @@ def load_model(model):
     else:
         print("Attempting to load as MultiTaskRoberta...")
         try:
-            themes = 1000
+            themes = 2000
             tones = 1
-            print(f"loading w num_themes={themes}, num_tones={tones}")
 
             checkpoint = torch.load(model, map_location="cpu")
             # Format A: checkpoint dict with "model_state_dict" key
@@ -29,6 +28,10 @@ def load_model(model):
             else:
                 # Format B: bare state dict
                 state = checkpoint
+
+            if "tone_head.weight" in state:
+                tones = state["tone_head.weight"].shape[0]
+            print(f"loading w num_themes={themes}, num_tones={tones}")
 
             classification_model = MultiTaskRoberta(
                 num_tones=tones, num_themes=themes, num_bias_classes=3

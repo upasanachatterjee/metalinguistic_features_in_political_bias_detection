@@ -48,11 +48,12 @@ class TrainArgs:
 class RunConfig:
     output_dir: str
     tasks: List[str] = field(
-        default_factory=lambda: ["triplet_ideology", "triplet_story", "mlm"]
+        default_factory=lambda: ["triplet_ideology", "mlm"]
     )
     theme_count: int = 2000
     tone_count: int = 2
     base_lr: float = 5e-5
+    init_from_checkpoint: Optional[str] = None
     train_args: TrainArgs = field(default_factory=TrainArgs)
     task_spec: TaskSpec = field(
         default_factory=lambda: TaskSpec(

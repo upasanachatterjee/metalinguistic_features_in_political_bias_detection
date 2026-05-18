@@ -39,10 +39,10 @@ class DatasetConfig:
 
 ALLSIDES_EXTENDED_MEDIA_SPLIT = "upasanachatterjee/article-bias-prediction-media-splits-updated"
 ALLSIDES_EXTENDED_RANDOM_SPLIT = "upasanachatterjee/allsides_random_split_extended"
-_BATCH_SIZE = 64
-_GRAD_ACCUMULATION = 32
+_BATCH_SIZE = 128
+_GRAD_ACCUMULATION = 64
 _NUM_WORKERS = 8
-_EVAL_BATCH_SIZE = 64
+_EVAL_BATCH_SIZE = 128
 
 
 def remove_int_bias_1(example):
