@@ -11,6 +11,7 @@ from transformers.models.auto.tokenization_auto import AutoTokenizer
 import time
 from transformers.optimization import get_linear_schedule_with_warmup
 import os
+import re
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Avoid tokenizer warnings
 
@@ -21,6 +22,14 @@ cfg = load_run_config(cli.config)
 
 output_dir = cfg.output_dir
 os.makedirs(output_dir, exist_ok=True)
+
+# Offset epoch numbering when continuing from an epoch-N.pt checkpoint, so we
+# don't overwrite the source file when output_dir is shared.
+epoch_offset = 0
+if cfg.init_from_checkpoint:
+    m = re.match(r"epoch-(\d+)", os.path.basename(cfg.init_from_checkpoint))
+    if m:
+        epoch_offset = int(m.group(1))
 
 # Set random seed
 set_seed(42)
@@ -487,7 +496,7 @@ while epoch < args.num_epochs:
 
     # Save checkpoint at end of epoch
     if accelerator.is_main_process:
-        epoch_checkpoint_path = f"{output_dir}/epoch-{epoch + 1}"
+        epoch_checkpoint_path = f"{output_dir}/epoch-{epoch_offset + epoch + 1}"
         print(f"Saving epoch checkpoint to {epoch_checkpoint_path}...")
         accelerator.unwrap_model(model).save_checkpoint(f"{epoch_checkpoint_path}.pt")
         print("Epoch checkpoint saved")
