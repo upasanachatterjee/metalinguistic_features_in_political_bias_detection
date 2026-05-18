@@ -67,14 +67,38 @@ print(f"TrainArgs loaded: {args.num_epochs} epochs, {args.model_name}")
 theme_count = cfg.theme_count
 subsample = cfg.task_spec.require_nonempty_themes_and_tone
 
-model = MultiTaskRoberta(
-    num_themes=theme_count, num_tones=1, num_bias_classes=None
-)
-
+ckpt = None
+ckpt_num_themes = theme_count
+ckpt_num_tones = 1
+ckpt_num_bias_classes = None
 if cfg.init_from_checkpoint:
     if accelerator.is_main_process:
         print(f"Loading initial weights from {cfg.init_from_checkpoint}")
     ckpt = torch.load(cfg.init_from_checkpoint, map_location="cpu", weights_only=False)
+    # Prefer head sizes baked into the checkpoint over current config defaults,
+    # otherwise load_state_dict will fail on shape mismatch.
+    ckpt_config = ckpt.get("config", {}) or {}
+    state = ckpt["model_state_dict"]
+    ckpt_num_themes = ckpt_config.get(
+        "num_themes", state["theme_head.weight"].shape[0]
+    )
+    ckpt_num_tones = ckpt_config.get(
+        "num_tones", state["tone_head.weight"].shape[0]
+    )
+    ckpt_num_bias_classes = ckpt_config.get("num_bias_classes", None)
+    if accelerator.is_main_process:
+        print(
+            f"  Using checkpoint head sizes: num_themes={ckpt_num_themes}, "
+            f"num_tones={ckpt_num_tones}, num_bias_classes={ckpt_num_bias_classes}"
+        )
+
+model = MultiTaskRoberta(
+    num_themes=ckpt_num_themes,
+    num_tones=ckpt_num_tones,
+    num_bias_classes=ckpt_num_bias_classes,
+)
+
+if ckpt is not None:
     missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
     if accelerator.is_main_process:
         if missing:
@@ -92,10 +116,10 @@ print(f"Model initialized: {model.__class__.__name__}")
 # Uses non-reentrant checkpointing (see model.gradient_checkpointing_enable)
 # because reentrant checkpointing trips DDP's "marked ready twice" assertion
 # when the shared backbone is forwarded multiple times per step.
-model.backbone.config.use_cache = False
-model.gradient_checkpointing_enable()
-if accelerator.is_main_process:
-    print("Gradient checkpointing enabled on backbone (use_reentrant=False)")
+# model.backbone.config.use_cache = False
+# model.gradient_checkpointing_enable()
+# if accelerator.is_main_process:
+#     print("Gradient checkpointing enabled on backbone (use_reentrant=False)")
 
 effective_batch_size = (
     args.batch_size
