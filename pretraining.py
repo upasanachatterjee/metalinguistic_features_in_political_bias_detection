@@ -5,6 +5,7 @@ from datetime import timedelta
 from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.utils import set_seed
 from dataset import build_dataloaders
+from gradient_diagnostics import GradientDiagnostics
 from model import MultiTaskRoberta
 from pretraining_utils import calculate_eta, load_run_config
 from transformers.models.auto.tokenization_auto import AutoTokenizer
@@ -46,6 +47,16 @@ accelerator = Accelerator(
 )
 
 args = cfg.train_args
+
+# Temporary gradient diagnostic (see gradient_diagnostics.py). Fail fast, before
+# the dataset is loaded, if it was launched on more than one process: the
+# per-task torch.autograd.grad calls must not run on a DDP-wrapped model.
+diag_cfg = cfg.gradient_diagnostics
+if diag_cfg.enabled and accelerator.num_processes != 1:
+    raise RuntimeError(
+        "Gradient diagnostics must be run with a single Accelerate process."
+    )
+diagnostic_only = diag_cfg.enabled and diag_cfg.diagnostic_only
 
 # Define which tasks to run
 available_tasks = cfg.tasks
@@ -92,10 +103,16 @@ if cfg.init_from_checkpoint:
             f"num_tones={ckpt_num_tones}, num_bias_classes={ckpt_num_bias_classes}"
         )
 
+loss_weights = cfg.loss_weights.as_dict()
+if accelerator.is_main_process:
+    label = "defaults (unweighted sum)" if cfg.loss_weights.is_default() else "OVERRIDDEN"
+    print(f"Per-task loss weights [{label}]: {loss_weights}")
+
 model = MultiTaskRoberta(
     num_themes=ckpt_num_themes,
     num_tones=ckpt_num_tones,
     num_bias_classes=ckpt_num_bias_classes,
+    loss_weights=loss_weights,
 )
 
 if ckpt is not None:
@@ -250,30 +267,60 @@ if not available_tasks:
     print("ERROR: No tasks available for training!")
     exit(1)
 
-# Create log file
+# Create log file. In diagnostic-only mode we do not train, so don't truncate an
+# existing training log; the diagnostic writes its own file instead.
 log_file = f"./{output_dir}/training_log.txt"
-with open(log_file, "w") as f:
-    f.write("Training Log\n")
-    f.write("=" * 50 + "\n")
-    f.write(f"Start Time: {__import__('datetime').datetime.now()}\n")
-    f.write(f"Model: {args.model_name}\n")
-    if cfg.init_from_checkpoint:
-        f.write(f"Init from checkpoint: {cfg.init_from_checkpoint}\n")
-    f.write(f"Dataset: {task_spec.dataset_name}\n")
-    f.write(f"Total Steps: {TOTAL_STEPS:,}\n")
-    f.write(f"GPUs: {accelerator.num_processes}\n")
-    f.write(f"Available Tasks: {available_tasks}\n")
-    f.write(f"Using num themes: {theme_count} and num tones: 1\n")
-    f.write(f"Num triplets per batch: {task_spec.max_triplet_samples}\n")
-    f.write(f"Subsampling for themes/tone: {subsample}\n")
-    f.write(f"Batch size: {args.batch_size}\n")
-    f.write(f"Num epochs: {args.num_epochs}\n")
-    f.write("=" * 50 + "\n\n")
-print(f"   Logging initialized: {log_file}")
+if diagnostic_only:
+    print("   Diagnostic-only run: leaving training_log.txt untouched")
+else:
+    with open(log_file, "w") as f:
+        f.write("Training Log\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Start Time: {__import__('datetime').datetime.now()}\n")
+        f.write(f"Model: {args.model_name}\n")
+        if cfg.init_from_checkpoint:
+            f.write(f"Init from checkpoint: {cfg.init_from_checkpoint}\n")
+        f.write(f"Dataset: {task_spec.dataset_name}\n")
+        f.write(f"Total Steps: {TOTAL_STEPS:,}\n")
+        f.write(f"GPUs: {accelerator.num_processes}\n")
+        f.write(f"Available Tasks: {available_tasks}\n")
+        f.write(f"Using num themes: {theme_count} and num tones: 1\n")
+        f.write(f"Num triplets per batch: {task_spec.max_triplet_samples}\n")
+        f.write(f"Subsampling for themes/tone: {subsample}\n")
+        f.write(f"Batch size: {args.batch_size}\n")
+        f.write(f"Num epochs: {args.num_epochs}\n")
+        f.write(f"Loss weights: {loss_weights}\n")
+        f.write("=" * 50 + "\n\n")
+    print(f"   Logging initialized: {log_file}")
+
+# Build the diagnostic after the model is prepared, so it can unwrap the model
+# and hold references to the shared-representation parameters.
+diagnostics = None
+if diag_cfg.enabled:
+    diagnostics = GradientDiagnostics(
+        accelerator=accelerator,
+        model=model,
+        config=diag_cfg,
+        output_dir=output_dir,
+        train_batch_size=args.batch_size,
+        # Recorded verbatim in the JSON/TXT so a reader can reproduce the run.
+        metadata={
+            "config_path": cli.config,
+            "seed": 42,
+            "model_name": args.model_name,
+            "dataset": task_spec.dataset_name,
+            "tasks": ",".join(available_tasks),
+            "max_triplet_samples": task_spec.max_triplet_samples,
+            "require_nonempty_themes_and_tone": subsample,
+            "init_from_checkpoint": cfg.init_from_checkpoint or "none",
+            "base_lr": base_lr,
+        },
+    )
 
 step = 0
 epoch = 0
 steps_in_current_epoch = 0
+diagnostics_reported = False
 model.train()
 
 # Loss tracking
@@ -383,6 +430,30 @@ while epoch < args.num_epochs:
             outputs = model(**combined_batch)
             total_loss = outputs.get("loss")
 
+            # 2b. Diagnostic (optional): per-task gradients on the shared
+            # representation. Runs after the forward pass and BEFORE the normal
+            # backward; uses torch.autograd.grad(retain_graph=True), so it never
+            # writes to .grad and leaves the graph intact for step 3.
+            if diagnostics is not None:
+                diagnostics.record_microbatch(outputs, combined_batch)
+
+                if diagnostic_only:
+                    # No backward, no optimizer/scheduler step: every virtual
+                    # batch measures the same model state. Drop the graph before
+                    # the next forward pass so memory doesn't stack up.
+                    del outputs, total_loss, combined_batch
+                    step += 1
+                    steps_in_current_epoch += 1
+                    if diagnostics.is_complete():
+                        break
+                    continue
+
+                if diagnostics.is_complete() and not diagnostics_reported:
+                    # Diagnostics ran alongside real training; report once and
+                    # let training carry on untouched.
+                    diagnostics.report()
+                    diagnostics_reported = True
+
             # 3. Perform a single backward pass on the combined loss
             if total_loss is not None:
                 accelerator.backward(total_loss)
@@ -473,6 +544,10 @@ while epoch < args.num_epochs:
         step += 1
         steps_in_current_epoch += 1
 
+    if diagnostic_only:
+        # Diagnostic-only run: no checkpoint, no epoch bookkeeping.
+        break
+
     # End of epoch
     epoch_steps = step - epoch_start_step
     print(f"\nCOMPLETED EPOCH {epoch + 1}")
@@ -500,6 +575,15 @@ while epoch < args.num_epochs:
         print(f"All iterators reinitialized for epoch {epoch + 1}")
 
     print("=" * 50)
+
+if diagnostic_only and diagnostics is not None:
+    diagnostics.report()
+    print(
+        f"\nDiagnostic-only run: {step} forward passes, no optimizer steps taken. "
+        "Training objective and weights are unchanged."
+    )
+    accelerator.end_training()
+    raise SystemExit(0)
 
 # Clean shutdown
 print("\nTraining completed! Cleaning up...")

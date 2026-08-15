@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import torch
 import yaml
+from gradient_diagnostics import GradientDiagnosticsConfig
 from huggingface_hub import login
 import time
 from datetime import datetime, timedelta
@@ -42,6 +43,32 @@ class TrainArgs:
 
 
 @dataclass
+class LossWeights:
+    """
+    Weights scale `total_loss` only; the per-task losses that get logged and
+    diagnosed stay raw, so numbers remain comparable across weightings.
+    """
+
+    triplet: float = 1.0
+    themes: float = 1.0
+    tone: float = 1.0
+    bias: float = 1.0
+    mlm: float = 1.0
+
+    def as_dict(self) -> dict:
+        return {
+            "triplet": self.triplet,
+            "themes": self.themes,
+            "tone": self.tone,
+            "bias": self.bias,
+            "mlm": self.mlm,
+        }
+
+    def is_default(self) -> bool:
+        return all(w == 1.0 for w in self.as_dict().values())
+
+
+@dataclass
 class RunConfig:
     output_dir: str
     tasks: List[str] = field(default_factory=lambda: ["triplet", "mlm"])
@@ -57,6 +84,12 @@ class RunConfig:
             max_triplet_samples=8,
         )
     )
+    loss_weights: LossWeights = field(default_factory=LossWeights)
+    # Temporary multi-task gradient diagnostic; disabled by default so normal
+    # training behaviour is unchanged.
+    gradient_diagnostics: GradientDiagnosticsConfig = field(
+        default_factory=GradientDiagnosticsConfig
+    )
 
 
 def load_run_config(path: str) -> RunConfig:
@@ -64,7 +97,15 @@ def load_run_config(path: str) -> RunConfig:
         raw = yaml.safe_load(f) or {}
     train_args = TrainArgs(**raw.pop("train_args", {}))
     task_spec = TaskSpec(**raw.pop("task_spec", {}))
-    return RunConfig(train_args=train_args, task_spec=task_spec, **raw)
+    grad_diag = GradientDiagnosticsConfig(**(raw.pop("gradient_diagnostics", {}) or {}))
+    loss_weights = LossWeights(**(raw.pop("loss_weights", {}) or {}))
+    return RunConfig(
+        train_args=train_args,
+        task_spec=task_spec,
+        loss_weights=loss_weights,
+        gradient_diagnostics=grad_diag,
+        **raw,
+    )
 
 
 def login_to_huggingface(token):

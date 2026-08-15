@@ -2,6 +2,14 @@ import torch.nn as nn
 from transformers import AutoModel, AutoModelForMaskedLM
 import torch
 
+DEFAULT_LOSS_WEIGHTS = {
+    "triplet": 1.0,
+    "themes": 1.0,
+    "tone": 1.0,
+    "bias": 1.0,
+    "mlm": 1.0,
+}
+
 
 class ClassificationHead(nn.Module):
     """Head for sentence-level classification tasks."""
@@ -24,9 +32,24 @@ class ClassificationHead(nn.Module):
 
 class MultiTaskRoberta(nn.Module):
     def __init__(
-        self, name="roberta-base", num_tones=1, num_themes=2000, num_bias_classes=None
+        self,
+        name="roberta-base",
+        num_tones=1,
+        num_themes=2000,
+        num_bias_classes=None,
+        loss_weights=None,
     ):
         super().__init__()
+        # Per-task loss weights
+        self.loss_weights = dict(DEFAULT_LOSS_WEIGHTS)
+        for task, weight in (loss_weights or {}).items():
+            if task not in DEFAULT_LOSS_WEIGHTS:
+                raise ValueError(
+                    f"Unknown loss weight '{task}'. "
+                    f"Expected one of {sorted(DEFAULT_LOSS_WEIGHTS)}."
+                )
+            self.loss_weights[task] = float(weight)
+
         # Single backbone model
         self.backbone = AutoModel.from_pretrained(name)
         hid = self.backbone.config.hidden_size
@@ -78,6 +101,9 @@ class MultiTaskRoberta(nn.Module):
 
     def forward(self, **kwargs):
         # print(f"going forward w kwargs: {kwargs.keys()}")
+        # Note: outputs["<task>_loss"] is always the RAW, unweighted task loss.
+        # Only `total_loss` applies self.loss_weights, so logging and the
+        # gradient diagnostic stay comparable across weightings.
         outputs = {}
         total_loss = torch.tensor(0.0, device=self.backbone.device)
 
@@ -95,7 +121,7 @@ class MultiTaskRoberta(nn.Module):
 
             triplet_loss_fct = nn.TripletMarginLoss(margin=1.0, p=2)
             triplet_loss = triplet_loss_fct(za, zp, zn)
-            total_loss += triplet_loss
+            total_loss += self.loss_weights["triplet"] * triplet_loss
             outputs["triplet_loss"] = triplet_loss
 
         # --- Classification Tasks (Themes & Tone) ---
@@ -109,7 +135,7 @@ class MultiTaskRoberta(nn.Module):
             theme_logits = self.theme_head(pooled)
             theme_loss_fct = nn.BCEWithLogitsLoss()
             theme_loss = theme_loss_fct(theme_logits, kwargs["theme_labels"].float())
-            total_loss += theme_loss
+            total_loss += self.loss_weights["themes"] * theme_loss
             outputs["theme_loss"] = theme_loss
             outputs["theme_logits"] = theme_logits
 
@@ -123,7 +149,7 @@ class MultiTaskRoberta(nn.Module):
             tone_logits = self.tone_head(pooled)
             tone_loss_fct = nn.MSELoss()
             tone_loss = tone_loss_fct(tone_logits, kwargs["tone_labels"].float())
-            total_loss += tone_loss
+            total_loss += self.loss_weights["tone"] * tone_loss
             outputs["tone_loss"] = tone_loss
             outputs["tone_logits"] = tone_logits
 
@@ -140,7 +166,7 @@ class MultiTaskRoberta(nn.Module):
             bias_logits = self.bias_head(pooled)
             bias_loss_fct = nn.CrossEntropyLoss()
             bias_loss = bias_loss_fct(bias_logits, kwargs["bias_labels"])
-            total_loss += bias_loss
+            total_loss += self.loss_weights["bias"] * bias_loss
             outputs["bias_loss"] = bias_loss
             outputs["bias_logits"] = bias_logits
         elif "labels" in kwargs and "input_ids" in kwargs and self.num_bias_classes and self.num_bias_classes > 0:
@@ -169,7 +195,7 @@ class MultiTaskRoberta(nn.Module):
             mlm_loss = mlm_loss_fct(
                 prediction_scores.view(-1, prediction_scores.size(-1)), labels.view(-1)
             )
-            total_loss += mlm_loss
+            total_loss += self.loss_weights["mlm"] * mlm_loss
             outputs["mlm_loss"] = mlm_loss
             outputs["mlm_logits"] = prediction_scores
 
@@ -215,6 +241,7 @@ class MultiTaskRoberta(nn.Module):
             "vocab_size": self.backbone.config.vocab_size,
             "num_themes": self.theme_head.out_features,
             "num_tones": self.tone_head.out_features,
+            "loss_weights": dict(self.loss_weights),
         }
         if self.num_bias_classes is not None:
             config["num_bias_classes"] = self.num_bias_classes

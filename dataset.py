@@ -424,7 +424,7 @@ def build_dataloaders(
             tok, task_spec, args, mlm_dataset, **loader_params
         )
 
-    print("   ✅ All lazy dataloaders built")
+    print("    All lazy dataloaders built")
     return dataloaders
 
 
