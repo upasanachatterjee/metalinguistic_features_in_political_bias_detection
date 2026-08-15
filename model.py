@@ -81,29 +81,22 @@ class MultiTaskRoberta(nn.Module):
         outputs = {}
         total_loss = torch.tensor(0.0, device=self.backbone.device)
 
-        # --- Triplet Tasks (ideology + story) ---
-        triplet_loss_fct = nn.TripletMarginLoss(margin=1.0, p=2)
-        for prefix, out_key in (
-            ("ideo_", "ideo_triplet_loss"),
-            ("story_", "story_triplet_loss"),
-        ):
-            a_ids_key = f"{prefix}a_ids"
-            if a_ids_key not in kwargs:
-                continue
-            a_ids, a_mask = kwargs[a_ids_key], kwargs[f"{prefix}a_mask"]
-            p_ids, p_mask = kwargs[f"{prefix}p_ids"], kwargs[f"{prefix}p_mask"]
-            n_ids, n_mask = kwargs[f"{prefix}n_ids"], kwargs[f"{prefix}n_mask"]
+        # --- Triplet Task ---
+        if "triplet_a_ids" in kwargs and kwargs["triplet_a_ids"].shape[0] > 0:
+            za = self.forward_single(
+                kwargs["triplet_a_ids"], kwargs["triplet_a_mask"]
+            )
+            zp = self.forward_single(
+                kwargs["triplet_p_ids"], kwargs["triplet_p_mask"]
+            )
+            zn = self.forward_single(
+                kwargs["triplet_n_ids"], kwargs["triplet_n_mask"]
+            )
 
-            if a_ids.shape[0] == 0:
-                continue
-
-            za = self.forward_single(a_ids, a_mask)
-            zp = self.forward_single(p_ids, p_mask)
-            zn = self.forward_single(n_ids, n_mask)
-
+            triplet_loss_fct = nn.TripletMarginLoss(margin=1.0, p=2)
             triplet_loss = triplet_loss_fct(za, zp, zn)
             total_loss += triplet_loss
-            outputs[out_key] = triplet_loss
+            outputs["triplet_loss"] = triplet_loss
 
         # --- Classification Tasks (Themes & Tone) ---
         # Theme Task

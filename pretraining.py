@@ -112,7 +112,7 @@ print(f"Model initialized: {model.__class__.__name__}")
 
 # Reduce activation memory: re-compute intermediate activations during backward
 # instead of storing them. Trades ~20-30% step time for ~5-10x lower activation
-# memory. Required for batch_size=32 with both triplet tasks active.
+# memory. Required for batch_size=32 with the triplet task active.
 # Uses non-reentrant checkpointing (see model.gradient_checkpointing_enable)
 # because reentrant checkpointing trips DDP's "marked ready twice" assertion
 # when the shared backbone is forwarded multiple times per step.
@@ -152,14 +152,7 @@ steps_per_epoch = {}
 for task_name, dataloader in dataloaders.items():
     if dataloader is not None:
         dataset_sizes[task_name] = len(dataloader.dataset)
-        raw_len = len(dataloader)
-        # triplet_story's sampler is already rank-aware, so len() returns
-        # per-rank batches. Scale back up so max_steps_per_epoch's later
-        # division by num_processes treats it on equal footing with the
-        # other loaders (which still report their global length here).
-        if task_name == "triplet_story":
-            raw_len *= accelerator.num_processes
-        steps_per_epoch[task_name] = raw_len
+        steps_per_epoch[task_name] = len(dataloader)
         print(
             f"   {task_name:12s}: {dataset_sizes[task_name]:,} samples, {steps_per_epoch[task_name]:,} steps per epoch"
         )
@@ -191,20 +184,10 @@ scheduler = get_linear_schedule_with_warmup(
 
 print("\nPreparing objects with Accelerator...")
 # Prepare dataloaders for distributed training as well.
-# `triplet_story` uses a custom rank-aware GroupBatchSampler; passing it
-# through accelerator.prepare would wrap it in BatchSamplerShard which
-# (a) iterates the full inner sampler on every rank, and (b) trips a bug
-# in DataLoaderShard.__iter__ when its first next() raises StopIteration.
-# Skip prepare for that loader and move batches to device manually.
-SKIP_PREPARE = {"triplet_story"}
-prepared_dataloaders = {}
-for name, dl in dataloaders.items():
-    if dl is None:
-        prepared_dataloaders[name] = None
-    elif name in SKIP_PREPARE:
-        prepared_dataloaders[name] = dl
-    else:
-        prepared_dataloaders[name] = accelerator.prepare(dl)
+prepared_dataloaders = {
+    name: (accelerator.prepare(dl) if dl is not None else None)
+    for name, dl in dataloaders.items()
+}
 
 (model, scheduler, optimizer) = accelerator.prepare(model, scheduler, optimizer)
 dataloaders = prepared_dataloaders  # Use prepared dataloaders
@@ -249,8 +232,7 @@ iters = {}
 
 # Maps logical task name -> dataloader key
 TASK_TO_DL = {
-    "triplet_ideology": "triplet_ideology",
-    "triplet_story": "triplet_story",
+    "triplet": "triplet",
     "mlm": "mlm",
     "tone": "tone",
     "themes": "themes",
@@ -296,8 +278,7 @@ model.train()
 
 # Loss tracking
 loss_accumulator = {
-    "triplet_ideology": [],
-    "triplet_story": [],
+    "triplet": [],
     "mlm": [],
     "tone": [],
     "themes": [],
@@ -305,8 +286,7 @@ loss_accumulator = {
 
 # Missing samples tracking
 missing_samples = {
-    "triplet_ideology": 0,
-    "triplet_story": 0,
+    "triplet": 0,
     "mlm": 0,
     "tone": 0,
     "themes": 0,
@@ -357,27 +337,15 @@ while epoch < args.num_epochs:
                 batch = get_next_batch(task_name, iters, dataloaders)
                 if batch is not None and not batch.get("_skip", False):
                     # Rename keys to be unique and descriptive for the model
-                    if task_name == "triplet_ideology":
+                    if task_name == "triplet":
                         combined_batch.update(
                             {
-                                "ideo_a_ids": batch["a_ids"],
-                                "ideo_a_mask": batch["a_mask"],
-                                "ideo_p_ids": batch["p_ids"],
-                                "ideo_p_mask": batch["p_mask"],
-                                "ideo_n_ids": batch["n_ids"],
-                                "ideo_n_mask": batch["n_mask"],
-                            }
-                        )
-                    elif task_name == "triplet_story":
-                        dev = accelerator.device
-                        combined_batch.update(
-                            {
-                                "story_a_ids": batch["a_ids"].to(dev, non_blocking=True),
-                                "story_a_mask": batch["a_mask"].to(dev, non_blocking=True),
-                                "story_p_ids": batch["p_ids"].to(dev, non_blocking=True),
-                                "story_p_mask": batch["p_mask"].to(dev, non_blocking=True),
-                                "story_n_ids": batch["n_ids"].to(dev, non_blocking=True),
-                                "story_n_mask": batch["n_mask"].to(dev, non_blocking=True),
+                                "triplet_a_ids": batch["a_ids"],
+                                "triplet_a_mask": batch["a_mask"],
+                                "triplet_p_ids": batch["p_ids"],
+                                "triplet_p_mask": batch["p_mask"],
+                                "triplet_n_ids": batch["n_ids"],
+                                "triplet_n_mask": batch["n_mask"],
                             }
                         )
                     elif task_name == "themes":
@@ -422,18 +390,11 @@ while epoch < args.num_epochs:
                 # Log individual losses returned from the model
                 if accelerator.is_main_process:
                     if (
-                        "ideo_triplet_loss" in outputs
-                        and outputs["ideo_triplet_loss"] is not None
+                        "triplet_loss" in outputs
+                        and outputs["triplet_loss"] is not None
                     ):
-                        loss_accumulator["triplet_ideology"].append(
-                            outputs["ideo_triplet_loss"].item()
-                        )
-                    if (
-                        "story_triplet_loss" in outputs
-                        and outputs["story_triplet_loss"] is not None
-                    ):
-                        loss_accumulator["triplet_story"].append(
-                            outputs["story_triplet_loss"].item()
+                        loss_accumulator["triplet"].append(
+                            outputs["triplet_loss"].item()
                         )
                     if "theme_loss" in outputs and outputs["theme_loss"] is not None:
                         loss_accumulator["themes"].append(outputs["theme_loss"].item())
@@ -453,7 +414,7 @@ while epoch < args.num_epochs:
         if accelerator.is_main_process and step % args.log_every == 0:
             # Calculate average losses for each task
             task_losses = {}
-            for task_name in ["triplet_ideology", "triplet_story", "mlm", "tone", "themes"]:
+            for task_name in ["triplet", "mlm", "tone", "themes"]:
                 if loss_accumulator[task_name]:
                     avg_loss = sum(loss_accumulator[task_name]) / len(
                         loss_accumulator[task_name]

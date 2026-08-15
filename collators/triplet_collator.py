@@ -4,9 +4,8 @@ from collators._triplet_utils import empty_triplet_batch, pack_triplets
 
 
 class TripletDataCollator:
-    """Ideology triplet mining: anchor/positive share political_bias, negative has opposite bias.
+    """Triplet mining: anchor/positive share political_bias, negative has opposite bias.
 
-    Ignores group_uid. Mirrors the original behavior used for the POLITICS-style ideology objective.
     """
 
     def __init__(
@@ -20,7 +19,7 @@ class TripletDataCollator:
         self.triplet_downsample_size = triplet_downsample_size
 
     def __call__(self, batch):
-        a_att, a_id, p_att, p_id, n_att, n_id = sample_ideology_triplets(
+        a_att, a_id, p_att, p_id, n_att, n_id = sample_triplets(
             batch, self.political_bias_field, self.triplet_downsample_size
         )
 
@@ -30,40 +29,40 @@ class TripletDataCollator:
         return pack_triplets(a_id, a_att, p_id, p_att, n_id, n_att, self.max_length)
 
 
-def sample_ideology_triplets(batch, political_bias_field, triplet_downsample_size):
-    ideology_groups = {"left": [], "right": []}
+def sample_triplets(batch, political_bias_field, triplet_downsample_size):
+    bias_groups = {"left": [], "right": []}
 
     for item in batch:
         ideology = item.get(political_bias_field)
 
         if ideology in ["left", "right"]:
-            ideology_groups[ideology].append(item)
+            bias_groups[ideology].append(item)
 
         if not isinstance(ideology, str):
             print(f"Unknown ideology format for item: {item}")
             return [], [], [], [], [], []
 
-    if len(ideology_groups["left"]) < 1 or len(ideology_groups["right"]) < 1:
+    if len(bias_groups["left"]) < 1 or len(bias_groups["right"]) < 1:
         return [], [], [], [], [], []
 
     all_triplets = []
 
-    if len(ideology_groups["left"]) >= 2:
-        for i, anchor in enumerate(ideology_groups["left"]):
+    if len(bias_groups["left"]) >= 2:
+        for i, anchor in enumerate(bias_groups["left"]):
             pos_candidates = [
-                p for j, p in enumerate(ideology_groups["left"]) if i != j
+                p for j, p in enumerate(bias_groups["left"]) if i != j
             ]
-            neg_candidates = ideology_groups["right"]
+            neg_candidates = bias_groups["right"]
             for positive in pos_candidates:
                 for negative in neg_candidates:
                     all_triplets.append((anchor, positive, negative))
 
-    if len(ideology_groups["right"]) >= 2:
-        for i, anchor in enumerate(ideology_groups["right"]):
+    if len(bias_groups["right"]) >= 2:
+        for i, anchor in enumerate(bias_groups["right"]):
             pos_candidates = [
-                p for j, p in enumerate(ideology_groups["right"]) if i != j
+                p for j, p in enumerate(bias_groups["right"]) if i != j
             ]
-            neg_candidates = ideology_groups["left"]
+            neg_candidates = bias_groups["left"]
             for positive in pos_candidates:
                 for negative in neg_candidates:
                     all_triplets.append((anchor, positive, negative))

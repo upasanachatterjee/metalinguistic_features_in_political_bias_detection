@@ -22,13 +22,10 @@ class TaskSpec:
     # Regression
     regression_col: Optional[str] = "V2Tone"  # column containing float target(s)
     max_triplet_samples: int = 16
-    # Group-aware sampler for the story triplet objective
-    group_batch_num_groups: int = 8
-    group_batch_per_group: int = 3
     # Subsampling: drop rows where V2Themes or V2Tone is missing/empty
     require_nonempty_themes_and_tone: bool = False
-    # Directory for cached group-index artifacts (one-time build, mmap'd on reuse)
-    group_index_cache_dir: str = "./cache"
+    # Directory for cached row-index artifacts (one-time build, mmap'd on reuse)
+    index_cache_dir: str = "./cache"
 
 
 @dataclass
@@ -40,16 +37,14 @@ class TrainArgs:
     batch_size: int = 32
     log_every: int = 5000
     # dataloader args
-    dataloader_num_workers: int = 4  # More workers for high-throughput GPUs
-    pin_memory: bool = True  # Faster CPU->GPU transfer
+    dataloader_num_workers: int = 4
+    pin_memory: bool = True 
 
 
 @dataclass
 class RunConfig:
     output_dir: str
-    tasks: List[str] = field(
-        default_factory=lambda: ["triplet_ideology", "mlm"]
-    )
+    tasks: List[str] = field(default_factory=lambda: ["triplet", "mlm"])
     theme_count: int = 2000
     tone_count: int = 2
     base_lr: float = 5e-5
