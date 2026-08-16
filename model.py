@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Sequence
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -9,7 +9,6 @@ DEFAULT_LOSS_WEIGHTS = {
     "triplet": 1.0,
     "themes": 1.0,
     "tone": 1.0,
-    "bias": 1.0,
     "mlm": 1.0,
 }
 
@@ -37,9 +36,10 @@ class MultiTaskRoberta(nn.Module):
     """Shared RoBERTa backbone with one head per task.
 
     `forward` dispatches on which prefixed keys are present in kwargs
-    (`triplet_*`, `theme_*`, `tone_*`, `mlm_*`, `bias_*`), so a single call can
+    (`triplet_*`, `theme_*`, `tone_*`, `mlm_*`), so a single call can
     carry any subset of the tasks; `pretraining.TASK_BATCH_KEYS` is the mapping
-    from collator output to those keys.
+    from collator output to those keys. `bias_*` dispatches the same way but
+    belongs to fine-tuning alone.
 
     `outputs["<task>_loss"]` is always the RAW, unweighted task loss;
     `outputs["<task>_weighted_loss"]` is that loss times its `loss_weights`
@@ -57,7 +57,6 @@ class MultiTaskRoberta(nn.Module):
         num_themes=2000,
         num_bias_classes=None,
         loss_weights=None,
-        theme_pos_weight: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         self.name = name
@@ -91,30 +90,14 @@ class MultiTaskRoberta(nn.Module):
         # Clean up the temporary model
         del mlm_model
 
-        # Per-class positive weighting inside the theme task. Non-persistent:
-        # it is derived from the training corpus, not learned, so it stays out
-        # of state_dict (which keeps checkpoints loadable by a model configured
-        # without it) while still following the module to its device.
-        if theme_pos_weight is None:
-            self.register_buffer("theme_pos_weight", None, persistent=False)
-        else:
-            weights = torch.as_tensor(theme_pos_weight, dtype=torch.float)
-            if weights.shape != (num_themes,):
-                raise ValueError(
-                    f"theme_pos_weight has shape {tuple(weights.shape)}, expected "
-                    f"({num_themes},) to match the theme head."
-                )
-            self.register_buffer("theme_pos_weight", weights, persistent=False)
-
         # When True, `forward` also returns detached triplet geometry under
         # `outputs["triplet_stats"]`. Off during normal training: each entry is
         # a GPU->CPU sync that the training loop has no use for.
         self.collect_triplet_stats = False
 
         # Per-task objectives. Stateless, so they carry no state_dict entries.
-        # (Themes use the functional BCE so `theme_pos_weight` can live in the
-        # non-persistent buffer above rather than inside an nn.Module.)
         self.triplet_loss_fct = nn.TripletMarginLoss(margin=self.TRIPLET_MARGIN, p=2)
+        self.theme_loss_fct = nn.BCEWithLogitsLoss()
         self.tone_loss_fct = nn.MSELoss()
         self.bias_loss_fct = nn.CrossEntropyLoss()
         self.mlm_loss_fct = nn.CrossEntropyLoss()
@@ -181,10 +164,8 @@ class MultiTaskRoberta(nn.Module):
             )
             pooled = self.forward_single(input_ids, attention_mask)
             theme_logits = self.theme_head(pooled)
-            theme_loss = F.binary_cross_entropy_with_logits(
-                theme_logits,
-                kwargs["theme_labels"].float(),
-                pos_weight=self.theme_pos_weight,
+            theme_loss = self.theme_loss_fct(
+                theme_logits, kwargs["theme_labels"].float()
             )
             weighted = self.loss_weights["themes"] * theme_loss
             total_loss += weighted
@@ -208,6 +189,7 @@ class MultiTaskRoberta(nn.Module):
             outputs["tone_logits"] = tone_logits
 
         # --- Single-Class Classification Task (e.g., Bias/Ideology) ---
+        # Fine-tuning only, and there it is the ONLY objective
         if "bias_labels" in kwargs and "bias_input_ids" in kwargs:
             assert self.num_bias_classes is not None, (
                 "num_bias_classes must be set during model initialization for classification."
@@ -219,10 +201,8 @@ class MultiTaskRoberta(nn.Module):
             pooled = self.forward_single(input_ids, attention_mask)
             bias_logits = self.bias_head(pooled)
             bias_loss = self.bias_loss_fct(bias_logits, kwargs["bias_labels"])
-            weighted = self.loss_weights["bias"] * bias_loss
-            total_loss += weighted
+            total_loss += bias_loss
             outputs["bias_loss"] = bias_loss
-            outputs["bias_weighted_loss"] = weighted
             outputs["bias_logits"] = bias_logits
 
         # --- MLM Task ---
@@ -299,13 +279,6 @@ class MultiTaskRoberta(nn.Module):
             "num_themes": self.theme_head.out_features,
             "num_tones": self.tone_head.out_features,
             "loss_weights": dict(self.loss_weights),
-            # theme_pos_weight is a non-persistent buffer, so it is not in
-            # state_dict; record it here to keep the checkpoint self-describing.
-            "theme_pos_weight": (
-                self.theme_pos_weight.detach().cpu().tolist()
-                if self.theme_pos_weight is not None
-                else None
-            ),
         }
         if self.num_bias_classes is not None:
             config["num_bias_classes"] = self.num_bias_classes

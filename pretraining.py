@@ -113,8 +113,8 @@ class PreparedRun:
 @dataclass
 class TrainingState:
     """Counters that persist across epochs."""
-
     step: int = 0
+    micro_step: int = 0
     started_at: float = field(default_factory=time.time)
     # Recent step durations, for the run-level ETA.
     step_times: Deque[float] = field(default_factory=lambda: deque(maxlen=ETA_WINDOW))
@@ -130,13 +130,15 @@ class TrainingState:
 # ------------------------------------------------------------------
 # setup
 # ------------------------------------------------------------------
-def build_accelerator(output_dir: str) -> Accelerator:
+def build_accelerator(
+    output_dir: str, gradient_accumulation_steps: int = 1
+) -> Accelerator:
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     # Long timeout so rank-0-only setup (filter-index build, dataset download)
     # doesn't trip the default 10-min NCCL barrier on cold caches.
     pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
     return Accelerator(
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         project_dir=output_dir,
         kwargs_handlers=[ddp_kwargs, pg_kwargs],
     )
@@ -164,7 +166,6 @@ def setup_model(cfg: RunConfig) -> Tuple[MultiTaskRoberta, Dict[str, Any]]:
     head_sizes: Dict[str, Any] = {
         "num_themes": cfg.theme_count,
         "num_tones": 1,
-        "num_bias_classes": None,
     }
 
     checkpoint = None
@@ -177,15 +178,10 @@ def setup_model(cfg: RunConfig) -> Tuple[MultiTaskRoberta, Dict[str, Any]]:
         head_sizes = {
             "num_themes": saved.get("num_themes", state["theme_head.weight"].shape[0]),
             "num_tones": saved.get("num_tones", state["tone_head.weight"].shape[0]),
-            "num_bias_classes": saved.get("num_bias_classes", None),
         }
 
-    theme_pos_weight = cfg.theme_loss.pos_weight(head_sizes["num_themes"])
-
     model = MultiTaskRoberta(
-        **head_sizes,
-        loss_weights=cfg.loss_weights.as_dict(),
-        theme_pos_weight=theme_pos_weight,
+        **head_sizes, loss_weights=cfg.loss_weights.as_dict()
     )
 
     if checkpoint is not None:
@@ -229,10 +225,22 @@ def prepare_run(cfg: RunConfig, accelerator: Accelerator) -> Tuple[PreparedRun, 
     )
 
     # Measured before `prepare` shards the loader across ranks, because
-    # total_steps feeds the LR schedule.
+    # total_steps feeds the LR schedule. Everything from here on counts
+    # OPTIMIZER steps, so gradient accumulation divides in alongside the rank
+    # count
     steps_per_epoch = len(dataloader)
-    max_steps_per_epoch = steps_per_epoch // accelerator.num_processes
+    max_steps_per_epoch = steps_per_epoch // (
+        accelerator.num_processes * args.gradient_accumulation_steps
+    )
     total_steps = args.num_epochs * max_steps_per_epoch
+    if args.max_steps is not None:
+        if args.max_steps > total_steps:
+            log(
+                f"   max_steps={args.max_steps:,} exceeds the {total_steps:,} "
+                f"optimizer steps {args.num_epochs} epoch(s) of this corpus "
+                "provide; training will stop when the data runs out."
+            )
+        total_steps = min(total_steps, args.max_steps)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.base_lr, weight_decay=0.01, fused=True
@@ -284,25 +292,22 @@ def run_summary_lines(
         f"dataset         : {spec.dataset_name}",
         f"tasks           : {', '.join(cfg.tasks)}",
         f"heads           : themes={head_sizes['num_themes']}, "
-        f"tones={head_sizes['num_tones']}, bias={head_sizes['num_bias_classes']}",
+        f"tones={head_sizes['num_tones']}",
         f"processes       : {accelerator.num_processes} "
         f"({accelerator.distributed_type}) on {accelerator.device}, "
         f"mixed precision {accelerator.mixed_precision}",
-        f"batch size      : {args.batch_size}/process "
-        f"({args.batch_size * accelerator.num_processes} total), "
-        f"{spec.max_triplet_samples} triplets/batch",
+        f"batch size      : {args.batch_size}/process x "
+        f"{accelerator.num_processes} process(es) x "
+        f"{args.gradient_accumulation_steps} accumulated = "
+        f"{args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps}"
+        f" examples/optimizer step, {spec.max_triplet_samples} triplets/batch",
         f"epochs          : {args.num_epochs} x {run.max_steps_per_epoch:,} "
-        f"= {run.total_steps:,} steps",
-        f"learning rate   : {cfg.base_lr} (warmup {args.warmup_ratio:.0%}, linear decay)",
+        f"= {run.total_steps:,} optimizer steps"
+        f"{f'  [capped by max_steps={args.max_steps:,}]' if args.max_steps is not None else ''}",
+        f"learning rate   : {cfg.base_lr} (warmup {args.warmup_ratio:.0%} = "
+        f"{int(run.total_steps * args.warmup_ratio):,} steps, linear decay)",
         f"loss weights    : {cfg.loss_weights.as_dict()}"
         f"{'' if cfg.loss_weights.is_default() else '  [OVERRIDDEN]'}",
-        "theme pos_weight: "
-        + (
-            f"on (max {cfg.theme_loss.max_pos_weight}, "
-            f"from {cfg.theme_loss.stats_path})"
-            if cfg.theme_loss.use_pos_weight
-            else "off"
-        ),
         f"subsampled rows : {spec.require_nonempty_themes_and_tone}",
         f"batching        : one shared loader, {len(run.dataloader.dataset):,} samples, "
         f"{steps_per_epoch:,} steps/epoch (all objectives see the same rows)",
@@ -338,8 +343,9 @@ def build_diagnostics(
         # produced nothing still records its (zero) gradient.
         active_tasks=run.active_tasks,
         checkpoint=cfg.init_from_checkpoint or "none",
-        theme_loss_config=cfg.theme_loss.as_dict(),
         seed=SEED,
+        gradient_accumulation_steps=cfg.train_args.gradient_accumulation_steps,
+        total_steps=run.total_steps,
         # Recorded verbatim in the JSON/TXT so a reader can reproduce the run.
         metadata={
             "config_path": config_path,
@@ -417,16 +423,24 @@ def train_one_epoch(
 
     epoch_start_time = time.time()
     steps_this_epoch = 0
+    group_start = time.time()
 
-    while steps_this_epoch < run.max_steps_per_epoch and state.step < run.total_steps:
-        step_start = time.time()
+    micro_budget = state.micro_step + run.max_steps_per_epoch * (
+        args.gradient_accumulation_steps + 1
+    )
+
+    while (
+        steps_this_epoch < run.max_steps_per_epoch
+        and state.step < run.total_steps
+        and state.micro_step < micro_budget
+    ):
+        stepped = False
 
         with accelerator.accumulate(run.model):
             batches, batch_iterator = next_batch(batch_iterator, run.dataloader)
             combined_batch = build_combined_batch(cfg.tasks, batches)
             if not combined_batch:
-                state.step += 1
-                steps_this_epoch += 1
+                state.micro_step += 1
                 continue
 
             outputs = run.model(**combined_batch)
@@ -436,7 +450,10 @@ def train_one_epoch(
             # representation. Runs after the forward pass and BEFORE the normal
             # backward; uses torch.autograd.grad(retain_graph=True), so it never
             # writes to .grad and leaves the graph intact for the real backward.
-            if diagnostics is not None:
+            if diagnostics is not None and diagnostics.should_measure(state.step):
+                # The step is stamped on every measurement, so a periodic run's
+                # snapshots carry the x-axis of the trend.
+                diagnostics.set_train_step(state.step)
                 diagnostics.record_microbatch(outputs, combined_batch)
 
                 if diagnostic_only:
@@ -445,6 +462,7 @@ def train_one_epoch(
                     # the next forward pass so memory doesn't stack up.
                     del outputs, total_loss, combined_batch
                     state.step += 1
+                    state.micro_step += 1
                     steps_this_epoch += 1
                     if diagnostics.is_complete():
                         return
@@ -471,11 +489,20 @@ def train_one_epoch(
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(run.model.parameters(), max_norm=1.0)
 
+            stepped = accelerator.sync_gradients
             run.optimizer.step()
             run.scheduler.step()
             run.optimizer.zero_grad()
 
-        state.step_times.append(time.time() - step_start)
+        state.micro_step += 1
+        if not stepped:
+            # Mid-accumulation: no optimizer step happened
+            continue
+
+        state.step += 1
+        steps_this_epoch += 1
+        state.step_times.append(time.time() - group_start)
+        group_start = time.time()
 
         if accelerator.is_main_process and state.step % args.log_every == 0:
             interval_losses = {
@@ -512,9 +539,6 @@ def train_one_epoch(
                     weighted_losses=interval_weighted,
                 )
 
-        state.step += 1
-        steps_this_epoch += 1
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -528,7 +552,9 @@ def main() -> None:
     os.makedirs(cfg.output_dir, exist_ok=True)
     set_seed(SEED)
 
-    accelerator = build_accelerator(cfg.output_dir)
+    accelerator = build_accelerator(
+        cfg.output_dir, cfg.train_args.gradient_accumulation_steps
+    )
 
     # Fail fast, before the dataset is loaded: the diagnostic's per-task
     # torch.autograd.grad calls must not run on a DDP-wrapped model.
@@ -585,6 +611,10 @@ def main() -> None:
         accelerator.end_training()
         return
 
+    if diagnostics is not None and diagnostics.periodic:
+        diagnostics.set_train_step(state.step)
+        diagnostics.report()
+
     accelerator.end_training()
 
     elapsed = str(timedelta(seconds=int(time.time() - state.started_at)))
@@ -592,7 +622,8 @@ def main() -> None:
     log("=" * 78)
     log(
         f"TRAINING COMPLETE: {cfg.train_args.num_epochs} epoch(s), "
-        f"{state.step:,} steps, {elapsed} elapsed"
+        f"{state.step:,} optimizer steps ({state.micro_step:,} forwards), "
+        f"{elapsed} elapsed"
     )
     log(f"checkpoints, training_log.txt and losses.tsv in {cfg.output_dir}")
     log("=" * 78)

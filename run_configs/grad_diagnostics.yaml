@@ -24,11 +24,7 @@ loss_weights:
   triplet: 1.0
   themes: 1.0
   tone: 1.0
-  bias: 1.0
   mlm: 1.0
-theme_loss:
-  use_pos_weight: false
-  max_pos_weight: 10.0
 gradient_diagnostics:
   enabled: true
   microbatches_per_virtual_batch: 8

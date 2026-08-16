@@ -15,9 +15,9 @@ the values audited here are byte-for-byte the values the collator feeds the
 model. Purely descriptive -- targets are trained in GDELT's own units and nothing
 consumes these numbers.
 
-**Themes.** Counts positives per theme over the same rows, which is what
-``ThemeLossConfig.pos_weight`` derives from and what tells you whether the theme
-loss is dominated by all-zero targets. Parsing goes through
+**Themes.** Counts positives per theme over the same rows -- how rare the rare
+themes are, and how much of the label space a document actually touches. Parsing
+goes through
 ``MultiLabelCollator``'s ``parse_multilabel`` and the same ``top_themes.txt``
 label ordering.
 
@@ -267,11 +267,10 @@ def theme_report_lines(stats: Dict[str, Any]) -> List[str]:
         )
     lines += [
         "",
-        "  pos_weight is OFF unless theme_loss.use_pos_weight is set. It "
-        "rebalances positives against negatives *inside* the theme task; it is "
-        "not a way to raise the theme gradient norm -- use loss_weights.themes "
-        "for that, and choose it from the gradient diagnostic, not from the "
-        "magnitude of the theme loss.",
+        "  Descriptive only: nothing consumes these numbers. The theme "
+        "objective is a plain unweighted BCE. If its gradient is too small, "
+        "loss_weights.themes is the knob -- chosen from the gradient "
+        "diagnostic, not from the magnitude of the theme loss.",
     ]
     return lines
 

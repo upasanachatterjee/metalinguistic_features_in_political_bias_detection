@@ -76,13 +76,12 @@ EPS = 1e-12
 
 # Logical task name -> exact key returned by MultiTaskRoberta.forward().
 # Verified against model.py: the model emits "triplet_loss", "theme_loss",
-# "tone_loss", "bias_loss" (only when num_bias_classes is set) and "mlm_loss",
+# "tone_loss", and "mlm_loss",
 # plus the summed "loss".
 TASK_LOSS_KEYS: Dict[str, str] = {
     "triplet": "triplet_loss",
     "themes": "theme_loss",
     "tone": "tone_loss",
-    "bias": "bias_loss",
     "mlm": "mlm_loss",
 }
 
@@ -92,7 +91,6 @@ TASK_BATCH_KEYS: Dict[str, str] = {
     "triplet": "triplet_a_ids",  # anchors; each anchor also pulls a pos + neg
     "themes": "theme_input_ids",
     "tone": "tone_input_ids",
-    "bias": "bias_input_ids",
     "mlm": "mlm_input_ids",
 }
 
@@ -136,6 +134,8 @@ TSV_COLUMNS: Tuple[str, ...] = (
     "microbatches_per_virtual_batch",
     "examples_per_virtual_batch",
     "checkpoint",
+    "train_step",
+    "loss_weights",
     "virtual_batch",
     "metric",
     "task_a",
@@ -180,6 +180,15 @@ class GradientDiagnosticsConfig:
     derived as e.g. ``scope-final_bs32_k8_global256_init``.
     ``records_path`` optionally appends every row to a shared sweep file as well
     as the per-run TSV.
+
+    ``diagnostics_every_n_virtual_batches`` turns the one-shot measurement into a
+    periodic one: every N virtual batches of training, a *snapshot* of
+    ``num_virtual_batches`` measurements is taken and written as its own file
+    set, so a single run shows how the objectives evolve. It needs
+    ``diagnostic_only: false`` -- a frozen model has no trend to show. When
+    ``train_args.gradient_accumulation_steps`` equals
+    ``microbatches_per_virtual_batch``, one virtual batch is exactly one
+    optimizer step and N is simply "every N training steps".
     """
 
     enabled: bool = False
@@ -187,6 +196,7 @@ class GradientDiagnosticsConfig:
     num_virtual_batches: int = 12
     parameter_scope: str = "final_encoder_layer"
     diagnostic_only: bool = True
+    diagnostics_every_n_virtual_batches: Optional[int] = None
     # Global batch size the diagnostic emulates: 8 GPUs x 32 per GPU.
     target_global_batch_size: int = 256
     # Cap on examples retained for the tone/theme quality metrics, to bound the
@@ -362,8 +372,9 @@ class GradientDiagnostics:
         metadata: Optional[Dict[str, Any]] = None,
         active_tasks: Optional[Sequence[str]] = None,
         checkpoint: Optional[str] = None,
-        theme_loss_config: Optional[Dict[str, Any]] = None,
         seed: Optional[int] = None,
+        gradient_accumulation_steps: int = 1,
+        total_steps: Optional[int] = None,
     ) -> None:
         if accelerator.num_processes != 1:
             raise RuntimeError(
@@ -400,15 +411,35 @@ class GradientDiagnostics:
                 "num_gpus x batch_size)."
             )
 
+        interval = config.diagnostics_every_n_virtual_batches
+        if interval is not None:
+            if interval < 1:
+                raise ValueError(
+                    "diagnostics_every_n_virtual_batches must be >= 1, got "
+                    f"{interval}."
+                )
+            if config.diagnostic_only:
+                raise ValueError(
+                    "diagnostics_every_n_virtual_batches needs diagnostic_only: "
+                    "false. Periodic snapshots exist to show how the objectives "
+                    "change AS THE MODEL TRAINS; diagnostic_only takes no "
+                    "optimizer steps, so every snapshot would measure the same "
+                    "frozen weights. For single-point measurements of a trained "
+                    "model, keep diagnostic_only: true and set "
+                    "init_from_checkpoint instead."
+                )
+
         self.accelerator = accelerator
         self.config = config
         self.output_dir = output_dir
         self.train_batch_size = train_batch_size
         self.metadata = dict(metadata or {})
         self.checkpoint = checkpoint or "none"
-        self.theme_loss_config = dict(theme_loss_config or {})
         self.seed = seed
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.total_steps = total_steps
         self.examples_per_virtual_batch = effective
+        self.virtual_batch_is_optimizer_step = gradient_accumulation_steps == k
 
         base_model = accelerator.unwrap_model(model)
         self.parameters, param_names = get_diagnostic_parameters(
@@ -440,24 +471,28 @@ class GradientDiagnostics:
 
         self._acc = _VirtualBatchAccumulator()
 
-        # Collected results across virtual batches.
+        # Per-snapshot measurement state; `_reset_window` clears it so each
+        # snapshot describes only its own slice of training.
         self.norm_history: Dict[str, List[float]] = {}
         self.cosine_history: Dict[Tuple[str, str], List[float]] = {}
         self.loss_history: Dict[str, List[float]] = {}
         self.triplet_history: Dict[str, List[float]] = {}
         self.virtual_batches: List[Dict[str, Any]] = []
-        self.completed_virtual_batches = 0
-
-        # Predictions kept for the tone/theme quality read-outs.
         self._tone_preds: List[float] = []
         self._tone_targets: List[float] = []
         self._theme_logits: List[Any] = []
         self._theme_labels: List[Any] = []
         self._task_metrics: Optional[Dict[str, Any]] = None
+        self.completed_virtual_batches = 0
+        self.window_virtual_batches = 0
+        self.snapshots: List[Dict[str, Any]] = []
+        self.current_train_step = 0
+        self.window_start_step = 0
 
         self._warned: set = set()
         self._lines: List[str] = []
         self._rows: List[Tuple[Any, ...]] = []
+        self._rows_flushed = 0
 
         self._emit_header(param_names)
 
@@ -484,6 +519,34 @@ class GradientDiagnostics:
             "physical batch of "
             f"{self.examples_per_virtual_batch}."
         )
+        if self.config.diagnostics_every_n_virtual_batches is not None:
+            interval = self.config.diagnostics_every_n_virtual_batches
+            self._emit(f"  gradient accumulation steps:   {self.gradient_accumulation_steps:>10}")
+            if self.virtual_batch_is_optimizer_step:
+                self._emit(
+                    f"  snapshot interval:             {interval:>10} virtual "
+                    f"batches = {interval} optimizer steps"
+                )
+                self._emit(
+                    "  -> one virtual batch IS one optimizer step: the measured "
+                    "gradient is the one the optimizer used."
+                )
+            else:
+                self._emit(
+                    f"  snapshot interval:             {interval:>10} virtual "
+                    f"batches = {interval * k} microbatches"
+                )
+                self._emit(
+                    f"  WARNING: gradient_accumulation_steps="
+                    f"{self.gradient_accumulation_steps} != K={k}, so a virtual "
+                    "batch is NOT an optimizer step and the snapshot interval "
+                    "does not read as training steps. Set "
+                    f"train_args.gradient_accumulation_steps: {k} to align them."
+                )
+            self._emit(
+                f"  measurements per snapshot:     "
+                f"{self.config.num_virtual_batches:>10}"
+            )
         self._emit("-" * 78)
 
         self._emit(f"  run id                       : {self.run_id}")
@@ -505,7 +568,6 @@ class GradientDiagnostics:
         self._emit(
             f"  loss weights in effect       : {self.applied_loss_weights or 'n/a'}"
         )
-        self._emit(f"  theme pos_weight             : {self.theme_loss_config or 'off'}")
         for key, value in self.metadata.items():
             self._emit(f"  {key:<29}: {value}")
 
@@ -534,8 +596,45 @@ class GradientDiagnostics:
     # ------------------------------------------------------------------
     # collection
     # ------------------------------------------------------------------
+    @property
+    def periodic(self) -> bool:
+        """True when snapshots are taken during training rather than once."""
+        return self.config.diagnostics_every_n_virtual_batches is not None
+
     def is_complete(self) -> bool:
+        """Whether the one-shot measurement has collected everything it needs.
+
+        Meaningless in periodic mode, where measurement continues for as long as
+        training does -- ``should_measure`` decides when to record instead.
+        """
+        if self.periodic:
+            return False
         return self.completed_virtual_batches >= self.config.num_virtual_batches
+
+    def should_measure(self, optimizer_step: int) -> bool:
+        """Whether this optimizer step falls inside a measurement window.
+        """
+        if not self.periodic:
+            return not self.is_complete()
+        interval = self.config.diagnostics_every_n_virtual_batches
+        assert interval is not None  # guarded by self.periodic
+        window = self.config.num_virtual_batches
+        if (optimizer_step % interval) < window:
+            return True
+        return self.total_steps is not None and optimizer_step >= (
+            self.total_steps - window
+        )
+
+    def set_train_step(self, optimizer_step: int) -> None:
+        """Tell the diagnostic which optimizer step it is currently measuring.
+
+        The first step of a window names the snapshot, so a snapshot reported at
+        step 400 is one that began measuring at step 400 rather than one that
+        happened to finish there.
+        """
+        if self.window_virtual_batches == 0 and self._acc.microbatches == 0:
+            self.window_start_step = optimizer_step
+        self.current_train_step = optimizer_step
 
     def record_microbatch(
         self,
@@ -688,7 +787,8 @@ class GradientDiagnostics:
         k = self.config.microbatches_per_virtual_batch
         acc = self._acc
         self.completed_virtual_batches += 1
-        index = self.completed_virtual_batches
+        self.window_virtual_batches += 1
+        index = self.window_virtual_batches
         wall_seconds = time.perf_counter() - acc.started
 
         # ||mean gradient||, NOT mean of per-microbatch norms. Always divided by
@@ -766,11 +866,15 @@ class GradientDiagnostics:
             self._row(index, "peak_mem_mib", "", "", round(peak_mib, 1))
             torch.cuda.reset_peak_memory_stats()
 
+        record["train_step"] = self.current_train_step
         self.virtual_batches.append(record)
         self._emit_virtual_batch(index, record, wall_seconds)
 
         # Reset accumulators for the next virtual batch.
         self._acc = _VirtualBatchAccumulator()
+
+        if self.periodic and self.window_virtual_batches >= self.config.num_virtual_batches:
+            self.emit_snapshot()
 
     def _finalize_triplet_stats(self, index: int) -> Dict[str, Any]:
         """Aggregate the virtual batch's per-microbatch triplet geometry."""
@@ -826,6 +930,68 @@ class GradientDiagnostics:
                 f"({triplet['empty_microbatches']} empty), active="
                 f"{'n/a' if active is None else f'{active:.2f}'}"
             )
+
+    # ------------------------------------------------------------------
+    # snapshots
+    # ------------------------------------------------------------------
+    def emit_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Close the current measurement window and write its own file set.
+
+        Returns the snapshot record, or None when nothing was measured (so a
+        final snapshot at the end of training is a no-op if the last window
+        happened to be empty).
+        """
+        if not self.virtual_batches:
+            return None
+
+        step = self.window_start_step
+        snapshot: Dict[str, Any] = {
+            "train_step": step,
+            "last_train_step": self.current_train_step,
+            "virtual_batches": list(self.virtual_batches),
+            "num_virtual_batches": len(self.virtual_batches),
+            "summary": self.summary(),
+            "task_metrics": self.task_metrics(),
+            "suggested_weights": self.suggested_weights(),
+        }
+        self.snapshots.append(snapshot)
+
+        self._emit("")
+        self._emit(
+            f"--- snapshot @ step {step}: {len(self.virtual_batches)} virtual "
+            f"batches -------------------"
+        )
+        for task in sorted(snapshot["summary"]["grad_norm"]):
+            row = snapshot["summary"]["grad_norm"][task]
+            loss = snapshot["summary"]["loss"].get(task, {}).get("median")
+            self._emit(
+                f"    {task:<10} ||g|| median {row['median']:>10.4f}   "
+                f"loss {'n/a' if loss is None else f'{loss:10.4f}'}"
+            )
+
+        self._write_outputs(snapshot_step=step)
+        self._reset_window()
+        return snapshot
+
+    def _reset_window(self) -> None:
+        """Clear per-window measurement state so the next snapshot stands alone.
+
+        Without this every snapshot would pool all training so far and the trend
+        would be invisible -- the medians would drift only as fast as a growing
+        sample lets them. The `_task_metrics` memo has to go too, or the cached
+        tone/theme numbers from the first window would be served forever.
+        """
+        self.norm_history = {}
+        self.cosine_history = {}
+        self.loss_history = {}
+        self.triplet_history = {}
+        self.virtual_batches = []
+        self.window_virtual_batches = 0
+        self._tone_preds = []
+        self._tone_targets = []
+        self._theme_logits = []
+        self._theme_labels = []
+        self._task_metrics = None
 
     # ------------------------------------------------------------------
     # reporting
@@ -930,6 +1096,15 @@ class GradientDiagnostics:
         }
 
     def report(self) -> None:
+        # In periodic mode any measurements still open belong to a final
+        # snapshot, so the last steps of training are represented.
+        if self.periodic:
+            self.emit_snapshot()
+            self._report_trend()
+            self._emit("=" * 78)
+            self._write_outputs()
+            return
+
         self._emit("")
         self._emit("=" * 78)
         self._emit(
@@ -953,6 +1128,130 @@ class GradientDiagnostics:
         self._report_weights()
         self._emit("=" * 78)
         self._write_outputs()
+
+    # ------------------------------------------------------------------
+    def _report_trend(self) -> None:
+        """Per-snapshot tables: how each objective moved over training."""
+        self._emit("")
+        self._emit("=" * 78)
+        self._emit(
+            f"TREND over {len(self.snapshots)} snapshots "
+            f"({self.config.num_virtual_batches} virtual batches each, "
+            f"{self.examples_per_virtual_batch} examples per virtual batch), "
+            f"scope: {self.config.parameter_scope}"
+        )
+        self._emit("=" * 78)
+
+        if not self.snapshots:
+            self._emit("No snapshots were collected.")
+            return
+
+        tasks = sorted(
+            {task for s in self.snapshots for task in s["summary"]["grad_norm"]}
+        )
+        pairs = sorted({p for s in self.snapshots for p in s["summary"]["cosine"]})
+
+        def table(title: str, note: str, columns: Sequence[str], cell) -> None:
+            # Width follows the longest column name, or pair names like
+            # "themes|triplet" run into each other in the header.
+            width = max(12, max((len(c) for c in columns), default=0) + 2)
+            self._emit("")
+            self._emit(title)
+            self._emit("")
+            header = f"{'step':>8}" + "".join(f"{c:>{width}}" for c in columns)
+            self._emit(header)
+            self._emit("-" * len(header))
+            for snap in self.snapshots:
+                row = f"{snap['train_step']:>8}"
+                for column in columns:
+                    value = cell(snap, column)
+                    row += (
+                        f"{'':>{width}}" if value is None
+                        else f"{value:>{width}.4f}"
+                    )
+                self._emit(row)
+            if note:
+                self._emit("")
+                self._emit(note)
+
+        table(
+            "Median gradient norm per task",
+            "  Balance across tasks, not quality. Flat is fine; a task whose "
+            "norm collapses toward 0 has stopped contributing.",
+            tasks,
+            lambda s, t: s["summary"]["grad_norm"].get(t, {}).get("median"),
+        )
+        table(
+            "Median RAW (unweighted) task loss",
+            "  THIS is the column that says whether a weighting is working: a "
+            "task whose raw loss falls is learning, whatever its gradient norm "
+            "does.",
+            tasks,
+            lambda s, t: s["summary"]["loss"].get(t, {}).get("median"),
+        )
+        if pairs:
+            table(
+                "Median gradient cosine per task pair",
+                "  Watch for a pair drifting consistently below -0.3 as training "
+                "proceeds; near-zero values are near-orthogonality, not conflict.",
+                pairs,
+                lambda s, p: s["summary"]["cosine"].get(p, {}).get("median"),
+            )
+
+        quality: List[Tuple[str, Any]] = [
+            ("tone_pearson", lambda s: s["task_metrics"].get("tone", {}).get("pearson")),
+            ("tone_spearman", lambda s: s["task_metrics"].get("tone", {}).get("spearman")),
+            ("tone_rmse", lambda s: s["task_metrics"].get("tone", {}).get("rmse")),
+            ("theme_f1_mic", lambda s: s["task_metrics"].get("themes", {}).get("f1_micro")),
+            ("theme_ap_mic", lambda s: s["task_metrics"].get("themes", {}).get("average_precision_micro")),
+        ]
+        if any(fn(s) is not None for s in self.snapshots for _, fn in quality):
+            lookup = dict(quality)
+            table(
+                "Task quality read-outs",
+                "  Measured on the training batches themselves, so these say the "
+                "heads are learning, not that they generalize (pretraining has no "
+                "validation split). Still the most decision-relevant rows here.",
+                [name for name, _ in quality],
+                lambda s, c: lookup[c](s),
+            )
+
+        triplet_keys = ["active_fraction", "mean_violation", "empty_microbatches"]
+        if any(
+            s["summary"].get("triplet", {}).get(key) for s in self.snapshots
+            for key in triplet_keys
+        ):
+            table(
+                "Triplet geometry",
+                "  A falling active_fraction means the model is solving the mined "
+                "triplets; that shrinks the triplet gradient for a good reason, "
+                "not a bad one.",
+                triplet_keys,
+                lambda s, c: s["summary"].get("triplet", {}).get(c, {}).get("median"),
+            )
+
+        self._emit("")
+        self._emit("Suggested weights at the LAST snapshot (informational only)")
+        self._emit("")
+        last = self.snapshots[-1]["suggested_weights"]
+        if "error" in last:
+            self._emit(f"  {last['error']}")
+        else:
+            header = f"{'task':<12}{'gradient':>12}{'raw':>10}{'rounded':>10}"
+            self._emit(header)
+            self._emit("-" * len(header))
+            for task in sorted(last["raw"], key=lambda t: -last["median_grad_norm"][t]):
+                self._emit(
+                    f"{task:<12}{last['median_grad_norm'][task]:>12.4f}"
+                    f"{last['raw'][task]:>10.3f}{last['rounded'][task]:>10.2f}"
+                )
+        self._emit("")
+        self._emit(
+            "  Nothing here was written back into any config, and the weights "
+            "this run used are unchanged. Choose a weighting from the raw-loss "
+            "and quality trends above; the gradient norms only tell you whether "
+            "the objectives are on comparable scales."
+        )
 
     def _report_norms(self, stats: Dict[str, Any]) -> None:
         self._emit("")
@@ -1099,7 +1398,7 @@ class GradientDiagnostics:
         )
         self._emit("")
         self._emit("    loss_weights:")
-        for task in ("triplet", "themes", "tone", "bias", "mlm"):
+        for task in ("triplet", "themes", "tone", "mlm"):
             value = weights["rounded"].get(task)
             suffix = "" if value is not None else "   # task not measured"
             self._emit(f"      {task}: {value if value is not None else 1.0}{suffix}")
@@ -1120,12 +1419,21 @@ class GradientDiagnostics:
                 self.config.microbatches_per_virtual_batch,
                 self.examples_per_virtual_batch,
                 self.checkpoint,
+                self.current_train_step,
+                self._loss_weights_tag(),
                 virtual_batch,
                 metric,
                 task_a,
                 task_b,
                 value,
             )
+        )
+
+    def _loss_weights_tag(self) -> str:
+        """Compact `triplet=1.0,themes=2.0,...` form for the TSV."""
+        return ",".join(
+            f"{task}={weight:g}"
+            for task, weight in sorted(self.applied_loss_weights.items())
         )
 
     def _json_record(self) -> Dict[str, Any]:
@@ -1155,7 +1463,11 @@ class GradientDiagnostics:
                 "num_diag_tensors": len(self.parameters),
                 "tracked_tasks": self.tracked_tasks,
                 "loss_weights_in_effect": self.applied_loss_weights,
-                "theme_loss": self.theme_loss_config,
+                "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                "virtual_batch_is_optimizer_step": self.virtual_batch_is_optimizer_step,
+                "snapshot_interval_virtual_batches": (
+                    self.config.diagnostics_every_n_virtual_batches
+                ),
                 "mixed_precision": getattr(self.accelerator, "mixed_precision", "no"),
                 "num_processes": self.accelerator.num_processes,
                 "device": str(getattr(self.accelerator, "device", "cpu")),
@@ -1189,16 +1501,36 @@ class GradientDiagnostics:
             "summary": self.summary(),
             "task_metrics": self.task_metrics(),
             "suggested_weights": self.suggested_weights(),
+            # Every snapshot taken so far, oldest first: the time series.
+            # Empty for a one-shot run.
+            "snapshots": self.snapshots,
         }
 
-    def _write_outputs(self) -> None:
+    def _write_outputs(self, snapshot_step: Optional[int] = None) -> None:
+        """Write the artifacts.
+
+        `snapshot_step` writes a self-contained per-snapshot pair
+        (`gradient_diagnostics_step-000480.{txt,json}`) alongside the cumulative
+        TSV, so a snapshot stays readable on its own and nothing an earlier
+        snapshot wrote is overwritten. Called with no step for the final report.
+        """
         if not self.output_dir:
             return
         os.makedirs(self.output_dir, exist_ok=True)
 
-        txt_path = os.path.join(self.output_dir, "gradient_diagnostics.txt")
+        if snapshot_step is not None:
+            stem = f"gradient_diagnostics_step-{snapshot_step:06d}"
+        else:
+            stem = "gradient_diagnostics"
+
+        txt_path = os.path.join(self.output_dir, f"{stem}.txt")
         with open(txt_path, "w") as handle:
             handle.write("\n".join(self._lines) + "\n")
+
+        json_path = os.path.join(self.output_dir, f"{stem}.json")
+        with open(json_path, "w") as handle:
+            json.dump(self._json_record(), handle, indent=2)
+            handle.write("\n")
 
         tsv_path = os.path.join(self.output_dir, "gradient_diagnostics.tsv")
         with open(tsv_path, "w") as handle:
@@ -1207,16 +1539,13 @@ class GradientDiagnostics:
             for row in self._rows:
                 handle.write("\t".join(str(v) for v in row) + "\n")
 
-        json_path = os.path.join(self.output_dir, "gradient_diagnostics.json")
-        with open(json_path, "w") as handle:
-            json.dump(self._json_record(), handle, indent=2)
-            handle.write("\n")
-
-        written = [txt_path, tsv_path, json_path]
+        written = [txt_path, json_path, tsv_path]
 
         # Optional shared sweep file: append so several runs (different scopes,
-        # batch sizes, K, checkpoints) land in one table for cross-run plots.
-        if self.config.records_path:
+        # batch sizes, K, checkpoints, loss weights) land in one table for
+        # cross-run plots. Only rows added since the last write go out, or every
+        # snapshot would re-append the whole history.
+        if self.config.records_path and len(self._rows) > self._rows_flushed:
             shared = self.config.records_path
             os.makedirs(os.path.dirname(shared) or ".", exist_ok=True)
             exists = os.path.exists(shared)
@@ -1224,9 +1553,10 @@ class GradientDiagnostics:
                 if not exists:
                     handle.write(TSV_HEADER_COMMENT)
                     handle.write("\t".join(TSV_COLUMNS) + "\n")
-                for row in self._rows:
+                for row in self._rows[self._rows_flushed :]:
                     handle.write("\t".join(str(v) for v in row) + "\n")
             written.append(f"{shared} (appended)")
+        self._rows_flushed = len(self._rows)
 
         print("\nGradient diagnostics written to:")
         for path in written:

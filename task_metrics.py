@@ -8,9 +8,9 @@ anything useful:
   head is the offset alone -- a head that learns the corpus mean and nothing
   else scores respectably. Correlation is what separates that from a head that
   actually tracks the target.
-* **Theme BCE** over 2000 mostly-rare labels is dominated by the easy negatives.
-  A head that predicts all-zero scores well under 0.5 gets a respectable loss
-  and zero F1.
+* **Theme BCE** is dominated by easy negatives: a document carries ~37 positive
+  themes out of 2000, so ~98% of every target vector is zeros. A head that
+  scores everything well under 0.5 gets a respectable loss and zero F1.
 
 Nothing here is wired into the optimizer; these are read-outs. The gradient
 diagnostic collects predictions as it runs and reports them, and fine-tuning /
@@ -148,9 +148,7 @@ def theme_metrics(
 ) -> Dict[str, Any]:
     """Score multi-label theme prediction.
 
-    `logits` are raw head outputs; they are squashed with a sigmoid here, so a
-    `pos_weight`-trained head is scored on the same footing as an unweighted one
-    (pos_weight shifts the loss, not the decision rule).
+    `logits` are raw head outputs; they are squashed with a sigmoid here.
 
     F1 uses a fixed `threshold`; average precision is threshold-free and is the
     more honest number when almost every label is rare -- report both.

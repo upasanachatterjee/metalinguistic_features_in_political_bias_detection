@@ -1,0 +1,60 @@
+# Short pilot that screens a loss_weights setting before a full pretraining run.
+#
+#   CUDA_VISIBLE_DEVICES=0 accelerate launch \
+#       --num_processes 1 --mixed_precision no \
+#       pretraining.py --config run_configs/grad_diagnostics_pilot.yaml
+#
+# Unlike grad_diagnostics.yaml (which freezes the model and measures one point),
+# this one TRAINS and takes a diagnostic snapshot every 100 optimizer steps, so a
+# single run shows how the four objectives move. Snapshots land at steps
+# 0, 100, 200, 300, 400 and a final one at 500.
+#
+# Two settings make the pilot comparable to the real 8-GPU run:
+#
+#   gradient_accumulation_steps: 8  Diagnostics force --num_processes 1, so a
+#     plain step here would see 32 examples instead of the real run's 256.
+#     Accumulating 8 restores the real 256-example step. It also makes one
+#     virtual batch exactly one optimizer step, so the diagnostic measures the
+#     very gradient the optimizer used and the snapshot interval reads as steps.
+#
+#   max_steps: 500  Also shortens the LR schedule, so warmup is 6% of 500 = 30
+#     steps and the LR completes a full decay arc. Without it, warmup would be
+#     6% of a ~51k-step epoch (~3,060 steps) and the pilot would end while the
+#     LR was still ramping at ~16% of peak, with the losses barely moved.
+#
+# To compare weightings, copy this file, change loss_weights and run_label, and
+# read the trend tables against each other (or the shared records_path TSV,
+# which carries a loss_weights column).
+output_dir: ./grad_diagnostics_pilot
+tasks: [triplet, mlm, tone, themes]
+theme_count: 2000
+base_lr: 5.0e-5
+train_args:
+  num_epochs: 1
+  batch_size: 32
+  gradient_accumulation_steps: 8   # -> 256 examples per optimizer step
+  max_steps: 500                   # also sets the LR schedule length
+  warmup_ratio: 0.06               # = 30 steps
+  log_every: 25
+task_spec:
+  dataset_name: upasanachatterjee/bignewsalign-with-gdelt
+  themes_path: top_themes.txt
+  max_triplet_samples: 16
+  require_nonempty_themes_and_tone: True
+# The thing under test. 1.0 everywhere is the unweighted baseline to compare
+# any candidate weighting against.
+loss_weights:
+  triplet: 1.0
+  themes: 1.0
+  tone: 1.0
+  mlm: 1.0
+gradient_diagnostics:
+  enabled: true
+  diagnostic_only: false           # required: the model has to actually train
+  microbatches_per_virtual_batch: 8
+  num_virtual_batches: 4           # measurements per snapshot
+  diagnostics_every_n_virtual_batches: 100
+  parameter_scope: final_encoder_layer
+  target_global_batch_size: 256
+  run_label: pilot_equal-weights   # change per weighting so runs stay separable
+  records_path: ./grad_diagnostics/sweep_records.tsv
