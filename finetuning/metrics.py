@@ -13,15 +13,43 @@ import torch
 import torch.nn.functional as F
 
 
+def _unpack(inputs, outputs):
+    """Pull (labels, logits, loss) out of a batch/output pair.
+
+    MultiTaskRoberta uses `bias_*` keys so one forward can carry several tasks;
+    the HF baselines use the plain `labels`/`logits`/`loss` names. Preferring
+    the prefixed key and falling back to the plain one lets a single Trainer
+    drive either. Any of the three may come back None.
+    """
+    labels = inputs.get("bias_labels")
+    if labels is None:
+        labels = inputs.get("labels")
+
+    if isinstance(outputs, dict):
+        logits = outputs.get("bias_logits")
+        if logits is None:
+            logits = outputs.get("logits")
+        loss = outputs.get("bias_loss")
+        if loss is None:
+            loss = outputs.get("loss")
+    else:
+        logits = getattr(outputs, "logits", outputs)
+        loss = getattr(outputs, "loss", None)
+
+    return labels, logits, loss
+
+
 class CustomTrainer(Trainer):
+    """Trainer that accepts either MultiTaskRoberta or an HF baseline.
+
+    The two disagree on output key names; `_unpack` reconciles them. Nothing
+    else here differs from the stock Trainer.
+    """
+
     def compute_loss(self, model, inputs, return_outputs=False):
-        _bias_labels = inputs.get("bias_labels")
-        labels = _bias_labels if _bias_labels is not None else inputs.get("labels")
         outputs = model(**inputs)
-        _bias_logits = outputs.get("bias_logits")
-        logits = _bias_logits if _bias_logits is not None else outputs.get("logits")
-        _bias_loss = outputs.get("bias_loss")
-        loss = _bias_loss if _bias_loss is not None else outputs.get("loss")
+        labels, logits, loss = _unpack(inputs, outputs)
+
         if loss is None:
             loss = F.cross_entropy(logits, labels)
         if not isinstance(outputs, dict):
@@ -31,25 +59,12 @@ class CustomTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        _bias_labels = inputs.get("bias_labels")
-        labels = _bias_labels if _bias_labels is not None else inputs.get("labels")
-
         with torch.no_grad():
             outputs = model(**inputs)
-
-            # Extract bias-specific outputs
-            if isinstance(outputs, dict):
-                _bias_loss = outputs.get("bias_loss")
-                loss = _bias_loss if _bias_loss is not None else outputs.get("loss")
-                _bias_logits = outputs.get("bias_logits")
-                logits = _bias_logits if _bias_logits is not None else outputs.get("logits")
-            else:
-                loss = outputs.loss if hasattr(outputs, "loss") else None
-                logits = outputs.logits if hasattr(outputs, "logits") else outputs
+        labels, logits, loss = _unpack(inputs, outputs)
 
         if prediction_loss_only:
             return (loss, None, None)
-
         return (loss, logits, labels)
 
 
@@ -138,6 +153,13 @@ def compute_metrics(eval_pred) -> Dict[str, Any]:
 def batched_predict_metrics_trainer(
     trainer: Trainer, dataset: Dataset, batch_size: int = 64
 ) -> Dict[str, Any]:
+    """Predict over the dataset in slices and score the result.
+
+    Sliced only to bound peak memory -- `preprocessing.clean_dataset_optimized`
+    truncates each article to one row, so one row is one article and the metrics
+    are per-article as they stand. Returns the metric dict plus the raw preds,
+    labels and ids, for error analysis.
+    """
     all_logits: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
     all_ids: List[Any] = []
@@ -166,29 +188,21 @@ def batched_predict_metrics_trainer(
         all_labels.append(labels)
         all_ids.extend(ids)
 
-    # Concatenate all results
-    logits = np.concatenate(all_logits, axis=0)
-    predictions = np.argmax(logits, axis=1).tolist()
-    labels = np.concatenate(all_labels, axis=0).tolist()
+    predicted = np.argmax(np.concatenate(all_logits, axis=0), axis=1)
+    actual = np.concatenate(all_labels, axis=0)
     ids = list(all_ids)
 
-    id_to_logits_labels = {}
-    for idx, pred, label in zip(ids, predictions, labels):
-        if idx not in id_to_logits_labels.keys():
-            id_to_logits_labels[idx] = [(pred, label)]
-        else:
-            id_to_logits_labels[idx].append((pred, label))
+    if len(set(ids)) != len(ids):
+        print(
+            f"WARNING: {len(ids) - len(set(ids))} duplicate ids in the evaluation "
+            "set. Metrics are per row, not per article; aggregate before comparing "
+            "against earlier results."
+        )
 
-    ids = list(id_to_logits_labels.keys())
-    values = [id_to_logits_labels[idx] for idx in ids]
-    values = [max(set(tuples), key=tuples.count) for tuples in values]
-    predictions = [int(tuples[0]) for tuples in values]
-    labels = [int(tuples[1]) for tuples in values]
+    metrics = _compute_classification_metrics(predicted, actual)
 
-    metrics = _compute_classification_metrics(np.array(predictions), np.array(labels))
-
-    metrics["preds"] = predictions
-    metrics["labels"] = labels
+    metrics["preds"] = [int(p) for p in predicted]
+    metrics["labels"] = [int(v) for v in actual]
     metrics["ids"] = ids
 
     return metrics

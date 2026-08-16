@@ -1,11 +1,17 @@
 import random
+from typing import Any, Dict, List, Sequence
 
-from collators._triplet_utils import empty_triplet_batch, pack_triplets
+from collators._triplet_utils import Triplet, empty_triplet_batch, pack_triplets
+
+OPPOSITE = {"left": "right", "right": "left"}
 
 
 class TripletDataCollator:
-    """Triplet mining: anchor/positive share political_bias, negative has opposite bias.
+    """Mines triplets within each batch: anchor and positive share a
+    `political_bias`, the negative carries the opposite one.
 
+    Batches with no usable left/right split are returned as a `_skip` batch and
+    contribute no triplet loss for that step.
     """
 
     def __init__(
@@ -19,74 +25,80 @@ class TripletDataCollator:
         self.triplet_downsample_size = triplet_downsample_size
 
     def __call__(self, batch):
-        a_att, a_id, p_att, p_id, n_att, n_id = sample_triplets(
+        triplets = sample_triplets(
             batch, self.political_bias_field, self.triplet_downsample_size
         )
-
-        if not a_id:
+        if not triplets:
             return empty_triplet_batch()
+        return pack_triplets(triplets, self.max_length)
 
-        return pack_triplets(a_id, a_att, p_id, p_att, n_id, n_att, self.max_length)
 
+def group_by_bias(
+    batch: Sequence[Dict[str, Any]], political_bias_field: str
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Split a batch into its left-leaning and right-leaning samples.
 
-def sample_triplets(batch, political_bias_field, triplet_downsample_size):
-    bias_groups = {"left": [], "right": []}
-
+    Samples with any other (or malformed) bias value are dropped; the corpus
+    also carries "center", which the contrastive objective has no use for.
+    """
+    groups: Dict[str, List[Dict[str, Any]]] = {"left": [], "right": []}
     for item in batch:
-        ideology = item.get(political_bias_field)
+        bias = item.get(political_bias_field)
+        if not isinstance(bias, str):
+            print(f"Unknown ideology format: {bias!r}; skipping sample")
+            continue
+        if bias in groups:
+            groups[bias].append(item)
+    return groups
 
-        if ideology in ["left", "right"]:
-            bias_groups[ideology].append(item)
 
-        if not isinstance(ideology, str):
-            print(f"Unknown ideology format for item: {item}")
-            return [], [], [], [], [], []
+def sample_triplets(
+    batch: Sequence[Dict[str, Any]],
+    political_bias_field: str,
+    max_triplets: int,
+    rng: random.Random = random,  # type: ignore[assignment]
+) -> List[Triplet]:
+    """Draw up to `max_triplets` (anchor, positive, negative) samples from a batch.
 
-    if len(bias_groups["left"]) < 1 or len(bias_groups["right"]) < 1:
-        return [], [], [], [], [], []
+    Anchor and positive share a bias, the negative has the opposite one.
+    """
+    groups = group_by_bias(batch, political_bias_field)
 
-    all_triplets = []
+    # A triplet needs two distinct samples from one side and one from the other.
+    usable = [
+        side
+        for side in ("left", "right")
+        if len(groups[side]) >= 2 and len(groups[OPPOSITE[side]]) >= 1
+    ]
+    if not usable:
+        print(
+            f"Batch has no usable left/right split: {[len(groups[side]) for side in ('left', 'right')]}"
+        )
+        return []
 
-    if len(bias_groups["left"]) >= 2:
-        for i, anchor in enumerate(bias_groups["left"]):
-            pos_candidates = [
-                p for j, p in enumerate(bias_groups["left"]) if i != j
-            ]
-            neg_candidates = bias_groups["right"]
-            for positive in pos_candidates:
-                for negative in neg_candidates:
-                    all_triplets.append((anchor, positive, negative))
-
-    if len(bias_groups["right"]) >= 2:
-        for i, anchor in enumerate(bias_groups["right"]):
-            pos_candidates = [
-                p for j, p in enumerate(bias_groups["right"]) if i != j
-            ]
-            neg_candidates = bias_groups["left"]
-            for positive in pos_candidates:
-                for negative in neg_candidates:
-                    all_triplets.append((anchor, positive, negative))
-
-    if len(all_triplets) > triplet_downsample_size:
-        all_triplets = random.sample(all_triplets, k=triplet_downsample_size)
-
-    anchor_attention, anchor_id = [], []
-    positive_attention, positive_id = [], []
-    negative_attention, negative_id = [], []
-
-    for anchor, positive, negative in all_triplets:
-        anchor_attention.append(anchor["attention_mask"])
-        anchor_id.append(anchor["input_ids"])
-        positive_attention.append(positive["attention_mask"])
-        positive_id.append(positive["input_ids"])
-        negative_attention.append(negative["attention_mask"])
-        negative_id.append(negative["input_ids"])
-
-    return (
-        anchor_attention,
-        anchor_id,
-        positive_attention,
-        positive_id,
-        negative_attention,
-        negative_id,
+    distinct_possible = sum(
+        len(groups[side]) * (len(groups[side]) - 1) * len(groups[OPPOSITE[side]])
+        for side in usable
     )
+    wanted = min(max_triplets, distinct_possible)
+
+    triplets: List[Triplet] = []
+    seen = set()
+    for _ in range(wanted * 20):
+        if len(triplets) == wanted:
+            break
+        side = rng.choice(usable)
+        anchor_idx, positive_idx = rng.sample(range(len(groups[side])), 2)
+        negative_idx = rng.randrange(len(groups[OPPOSITE[side]]))
+        key = (side, anchor_idx, positive_idx, negative_idx)
+        if key in seen:
+            continue
+        seen.add(key)
+        triplets.append(
+            (
+                groups[side][anchor_idx],
+                groups[side][positive_idx],
+                groups[OPPOSITE[side]][negative_idx],
+            )
+        )
+    return triplets

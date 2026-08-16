@@ -10,21 +10,21 @@ class MultiLabelCollator:
         self.num_labels = len(self.top_themes)
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        input_ids = [torch.tensor(item["input_ids"]) for item in batch]
-        attention_mask = [torch.tensor(item["attention_mask"]) for item in batch]
-        themes = [item["V2Themes"] for item in batch]
-        themes = [parse_multilabel(theme) for theme in themes]  # parse and dedupe
+        themes = [parse_multilabel(item["V2Themes"]) for item in batch]
 
         input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True, padding_value=0
+            [torch.tensor(item["input_ids"]) for item in batch],
+            batch_first=True,
+            padding_value=0,
         )
         attention_mask = torch.nn.utils.rnn.pad_sequence(
-            attention_mask, batch_first=True, padding_value=0
+            [torch.tensor(item["attention_mask"]) for item in batch],
+            batch_first=True,
+            padding_value=0,
         )
 
         # Create multi-hot labels for each item in the batch
-        batch_size = len(batch)
-        multi_hot_labels = torch.zeros(batch_size, self.num_labels, dtype=torch.float)
+        multi_hot_labels = torch.zeros(len(batch), self.num_labels, dtype=torch.float)
 
         for batch_idx, theme_list in enumerate(themes):
             if theme_list is None:

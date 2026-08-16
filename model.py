@@ -31,6 +31,17 @@ class ClassificationHead(nn.Module):
 
 
 class MultiTaskRoberta(nn.Module):
+    """Shared RoBERTa backbone with one head per task.
+
+    `forward` dispatches on which prefixed keys are present in kwargs
+    (`triplet_*`, `theme_*`, `tone_*`, `mlm_*`, `bias_*`), so a single call can
+    carry any subset of the tasks; `pretraining.TASK_BATCH_KEYS` is the mapping
+    from collator output to those keys.
+
+    `outputs["<task>_loss"]` is always the RAW, unweighted task loss. Only
+    `outputs["loss"]` applies `loss_weights`.
+    """
+
     def __init__(
         self,
         name="roberta-base",
@@ -40,6 +51,7 @@ class MultiTaskRoberta(nn.Module):
         loss_weights=None,
     ):
         super().__init__()
+        self.name = name
         # Per-task loss weights
         self.loss_weights = dict(DEFAULT_LOSS_WEIGHTS)
         for task, weight in (loss_weights or {}).items():
@@ -69,6 +81,13 @@ class MultiTaskRoberta(nn.Module):
         self.lm_head = mlm_model.lm_head
         # Clean up the temporary model
         del mlm_model
+
+        # Per-task objectives. Stateless, so they carry no state_dict entries.
+        self.triplet_loss_fct = nn.TripletMarginLoss(margin=1.0, p=2)
+        self.theme_loss_fct = nn.BCEWithLogitsLoss()
+        self.tone_loss_fct = nn.MSELoss()
+        self.bias_loss_fct = nn.CrossEntropyLoss()
+        self.mlm_loss_fct = nn.CrossEntropyLoss()
 
     # Add these methods to support gradient checkpointing
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
@@ -100,10 +119,6 @@ class MultiTaskRoberta(nn.Module):
         return self
 
     def forward(self, **kwargs):
-        # print(f"going forward w kwargs: {kwargs.keys()}")
-        # Note: outputs["<task>_loss"] is always the RAW, unweighted task loss.
-        # Only `total_loss` applies self.loss_weights, so logging and the
-        # gradient diagnostic stay comparable across weightings.
         outputs = {}
         total_loss = torch.tensor(0.0, device=self.backbone.device)
 
@@ -119,8 +134,7 @@ class MultiTaskRoberta(nn.Module):
                 kwargs["triplet_n_ids"], kwargs["triplet_n_mask"]
             )
 
-            triplet_loss_fct = nn.TripletMarginLoss(margin=1.0, p=2)
-            triplet_loss = triplet_loss_fct(za, zp, zn)
+            triplet_loss = self.triplet_loss_fct(za, zp, zn)
             total_loss += self.loss_weights["triplet"] * triplet_loss
             outputs["triplet_loss"] = triplet_loss
 
@@ -133,8 +147,9 @@ class MultiTaskRoberta(nn.Module):
             )
             pooled = self.forward_single(input_ids, attention_mask)
             theme_logits = self.theme_head(pooled)
-            theme_loss_fct = nn.BCEWithLogitsLoss()
-            theme_loss = theme_loss_fct(theme_logits, kwargs["theme_labels"].float())
+            theme_loss = self.theme_loss_fct(
+                theme_logits, kwargs["theme_labels"].float()
+            )
             total_loss += self.loss_weights["themes"] * theme_loss
             outputs["theme_loss"] = theme_loss
             outputs["theme_logits"] = theme_logits
@@ -147,8 +162,7 @@ class MultiTaskRoberta(nn.Module):
             )
             pooled = self.forward_single(input_ids, attention_mask)
             tone_logits = self.tone_head(pooled)
-            tone_loss_fct = nn.MSELoss()
-            tone_loss = tone_loss_fct(tone_logits, kwargs["tone_labels"].float())
+            tone_loss = self.tone_loss_fct(tone_logits, kwargs["tone_labels"].float())
             total_loss += self.loss_weights["tone"] * tone_loss
             outputs["tone_loss"] = tone_loss
             outputs["tone_logits"] = tone_logits
@@ -164,15 +178,10 @@ class MultiTaskRoberta(nn.Module):
             )
             pooled = self.forward_single(input_ids, attention_mask)
             bias_logits = self.bias_head(pooled)
-            bias_loss_fct = nn.CrossEntropyLoss()
-            bias_loss = bias_loss_fct(bias_logits, kwargs["bias_labels"])
+            bias_loss = self.bias_loss_fct(bias_logits, kwargs["bias_labels"])
             total_loss += self.loss_weights["bias"] * bias_loss
             outputs["bias_loss"] = bias_loss
             outputs["bias_logits"] = bias_logits
-        elif "labels" in kwargs and "input_ids" in kwargs and self.num_bias_classes and self.num_bias_classes > 0:
-            raise ValueError(
-                "num_bias_classes > 0 but no bias_labels or bias_input_ids found"
-            )
 
         # --- MLM Task ---
         if "mlm_input_ids" in kwargs:
@@ -191,8 +200,7 @@ class MultiTaskRoberta(nn.Module):
             sequence_output = backbone_output.last_hidden_state
             prediction_scores = self.lm_head(sequence_output)
 
-            mlm_loss_fct = nn.CrossEntropyLoss()
-            mlm_loss = mlm_loss_fct(
+            mlm_loss = self.mlm_loss_fct(
                 prediction_scores.view(-1, prediction_scores.size(-1)), labels.view(-1)
             )
             total_loss += self.loss_weights["mlm"] * mlm_loss
@@ -214,29 +222,10 @@ class MultiTaskRoberta(nn.Module):
         cls_embedding = backbone_output.last_hidden_state[:, 0, :]
         return cls_embedding
 
-    # Add this method to your MultiTaskRoberta class or create a subclass
-    def forward_classification(self, input_ids, attention_mask=None, labels=None):
-        # Get the pooled representation
-        pooled = self.forward_single(input_ids, attention_mask)
-
-        # Use the new bias_head for single-class classification
-        logits = self.bias_head(pooled)
-
-        loss = None
-        if labels is not None:
-            loss_fn = nn.CrossEntropyLoss()
-            loss = loss_fn(logits, labels)
-
-        # Return in the format expected by Trainer
-        return {
-            "loss": loss,
-            "logits": logits,
-        }
-
     def save_checkpoint(self, path):
-        """Save model checkpoint with config info"""
+        """Save state dict plus the head sizes needed to rebuild the model."""
         config = {
-            "name": getattr(self, "name", "roberta-base"),
+            "name": self.name,
             "hidden_size": self.backbone.config.hidden_size,
             "vocab_size": self.backbone.config.vocab_size,
             "num_themes": self.theme_head.out_features,

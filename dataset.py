@@ -1,13 +1,12 @@
-import hashlib
 import os
 import time
 import numpy as np
-import pyarrow as pa
-import pyarrow.compute as pc
 from accelerate.state import PartialState
+from huggingface_hub import login
 from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader, Dataset as TorchDataset
-from pretraining_utils import TaskSpec, TrainArgs, login_to_huggingface
+from config import TaskSpec, TrainArgs
+from row_selection import select_rows
 from typing import Any, Dict, Iterable, Optional
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.tokenization_utils import PreTrainedTokenizer
@@ -15,192 +14,41 @@ from collators.triplet_collator import TripletDataCollator
 from collators.multi_label_collator import MultiLabelCollator
 from collators.regression_collator import RegressionCollator
 
-_hf_login_state = PartialState()
-if _hf_login_state.is_main_process:
-    login_to_huggingface(os.getenv("hf_token"))
-_hf_login_state.wait_for_everyone()
+# Metadata columns no task reads; dropped to keep the mapped table small.
+UNUSED_COLUMNS = ["source", "title", "html", "url", "date", "group_uid"]
 
 
-def _filter_index_cache_path(
-    cache_dir: str, dataset_name: str, split: str, n_rows: int
-) -> str:
-    key = f"filter|{dataset_name}|{split}|themes_and_tone|n={n_rows}"
-    h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
-    return os.path.join(cache_dir, f"filter_index_{h}.npy")
+def _login_once(state: PartialState) -> None:
+    """Authenticate rank 0 before any rank touches the Hub.
 
-
-def _nonempty_mask(col: pa.ChunkedArray) -> pa.ChunkedArray:
-    """Null-free boolean mask of rows where `col` is populated.
-
-    Works whether the column is string-typed (treat empty as missing) or numeric
-    (just non-null). Operates on Arrow buffers — no Python list copy.
-
-    The result is explicitly null-filled: `utf8_length` propagates nulls, and a
-    mask carrying nulls decays to an object-dtype ndarray on the numpy side.
+    The corpus is a private dataset, so this has to happen before
+    `load_dataset`. Logging in from every rank at once races on the same token
+    file, hence the rank-0 gate and the barrier.
     """
-    if pa.types.is_string(col.type) or pa.types.is_large_string(col.type):
-        # Skip whitespace-trim: it allocates a full string-column copy
-        # (multi-GB for V2Themes at 5M rows). GDELT columns are either
-        # populated or null in practice, so length-on-original is enough.
-        len_ok = pc.greater(pc.utf8_length(col), 0)
-        return pc.fill_null(pc.and_(pc.is_valid(col), len_ok), False)
-    return pc.is_valid(col)
-
-
-def _build_or_load_filter_index(
-    dataset_raw: Dataset, cache_path: str, state: PartialState
-) -> np.ndarray:
-    """Compute row indices where V2Themes and V2Tone are both non-empty.
-
-    Built once on rank 0 (scanning the two Arrow columns directly, avoiding the
-    per-rank `dataset.filter(...)` that materializes a fresh Arrow table on every
-    process), then mmap'd by all ranks.
-    """
-    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-
-    if state.is_main_process and not os.path.exists(cache_path):
-        print(f"   [filter-index] Building (one-time) at {cache_path}", flush=True)
-        t0 = time.perf_counter()
-
-        t = time.perf_counter()
-        themes_ok = _nonempty_mask(dataset_raw.data.column("V2Themes"))
-        tone_ok = _nonempty_mask(dataset_raw.data.column("V2Tone"))
-        keep_mask = pc.and_(themes_ok, tone_ok)
-        print(f"   [filter-index] arrow masks computed in {time.perf_counter() - t:.1f}s", flush=True)
-
-        t = time.perf_counter()
-        keep_np = np.concatenate([np.asarray(chunk) for chunk in keep_mask.chunks])
-        indices = np.flatnonzero(keep_np).astype(np.int64)
-        print(f"   [filter-index] np concat+flatnonzero in {time.perf_counter() - t:.1f}s", flush=True)
-
-        t = time.perf_counter()
-        np.save(cache_path, indices)
-        print(f"   [filter-index] np.save in {time.perf_counter() - t:.1f}s", flush=True)
-
-        print(
-            f"   [filter-index] DONE in {time.perf_counter() - t0:.1f}s — "
-            f"kept {len(indices):,}/{len(dataset_raw):,} rows",
-            flush=True,
-        )
-
-    t_bar = time.perf_counter()
-    state.wait_for_everyone()
-    print(
-        f"   [filter-index] rank={state.process_index} barrier waited "
-        f"{time.perf_counter() - t_bar:.1f}s",
-        flush=True,
-    )
-    return np.load(cache_path, mmap_mode="r")
-
-
-def _title_index_cache_path(
-    cache_dir: str, dataset_name: str, split: str, filtered: bool, n_rows: int
-) -> str:
-    key = f"title|{dataset_name}|{split}|filtered={filtered}|n={n_rows}"
-    h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
-    return os.path.join(cache_dir, f"title_index_{h}.npy")
-
-
-def _build_or_load_first_title_index(
-    dataset_raw: Dataset,
-    cache_path: str,
-    state: PartialState,
-    candidate_indices: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """Row indices of the first occurrence of each distinct title.
-
-    Rows whose title is null/empty are dropped entirely.
-
-    `candidate_indices` scopes the dedup to rows that survived earlier filtering,
-    so "first" means first *among kept rows*; the result is then a subset of it.
-
-    Built once on rank 0 (scanning the Arrow column directly) then mmap'd by all
-    ranks, mirroring `_build_or_load_filter_index`.
-    """
-    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-
-    if state.is_main_process and not os.path.exists(cache_path):
-        print(f"   [title-index] Building (one-time) at {cache_path}", flush=True)
-        t0 = time.perf_counter()
-
-        t = time.perf_counter()
-        col = dataset_raw.data.column("title")
-        # Dictionary-encode so dedup happens over int32 codes instead of strings.
-        # Null titles encode to null indices; fill them with -1 so the array stays
-        # integer-typed, and track them in `has_title` so they can be dropped.
-        if len(col) == 0:
-            # A zero-row column has zero chunks, which np.concatenate rejects.
-            codes = np.zeros(0, dtype=np.int32)
-            has_title = np.zeros(0, dtype=bool)
+    if state.is_main_process:
+        token = os.getenv("hf_token")
+        if token:
+            login(token)
+            print("   logged in to the Hugging Face Hub", flush=True)
         else:
-            encoded = pc.dictionary_encode(col)
-            codes = np.concatenate(
-                [np.asarray(chunk.indices.fill_null(-1)) for chunk in encoded.chunks]
+            print(
+                "   no hf_token in the environment; relying on a cached login",
+                flush=True,
             )
-            has_title = np.concatenate(
-                [np.asarray(chunk) for chunk in _nonempty_mask(col).chunks]
-            )
-        print(
-            f"   [title-index] dictionary_encode + concat in "
-            f"{time.perf_counter() - t:.1f}s ({len(codes):,} rows)",
-            flush=True,
-        )
-
-        if candidate_indices is not None:
-            candidate_indices = np.asarray(candidate_indices)
-            codes = codes[candidate_indices]
-            has_title = has_title[candidate_indices]
-
-        n_candidates = len(codes)
-
-        t = time.perf_counter()
-        # Untitled rows are dropped outright, so they never reach the dedup.
-        titled = np.flatnonzero(has_title)
-        codes = codes[titled]
-        # Stable argsort groups equal codes together while preserving original row
-        # order within a group, so the first position of each group is the first
-        # occurrence of that title.
-        order = np.argsort(codes, kind="stable")
-        sorted_codes = codes[order]
-        if len(sorted_codes) == 0:
-            keep = np.zeros(0, dtype=np.int64)
-        else:
-            change = np.empty(len(sorted_codes), dtype=bool)
-            change[0] = True
-            change[1:] = sorted_codes[1:] != sorted_codes[:-1]
-            # `titled` is ascending, so mapping back through it recovers positions
-            # in the candidate space.
-            keep = titled[order[np.flatnonzero(change)]].astype(np.int64)
-        print(f"   [title-index] dedup in {time.perf_counter() - t:.1f}s", flush=True)
-
-        indices = candidate_indices[keep] if candidate_indices is not None else keep
-        indices = np.sort(indices).astype(np.int64)
-
-        t = time.perf_counter()
-        np.save(cache_path, indices)
-        print(f"   [title-index] np.save in {time.perf_counter() - t:.1f}s", flush=True)
-
-        print(
-            f"   [title-index] DONE in {time.perf_counter() - t0:.1f}s — "
-            f"kept {len(indices):,}/{n_candidates:,} rows "
-            f"({n_candidates - len(titled):,} untitled dropped)",
-            flush=True,
-        )
-
-    t_bar = time.perf_counter()
     state.wait_for_everyone()
-    print(
-        f"   [title-index] rank={state.process_index} barrier waited "
-        f"{time.perf_counter() - t_bar:.1f}s",
-        flush=True,
-    )
-    return np.load(cache_path, mmap_mode="r")
 
 
 class MemoryEfficientDataset(TorchDataset):
-    """
-    Alternative approach using HuggingFace datasets with memory mapping.
-    Uses datasets' built-in lazy loading with memory mapping.
+    """Memory-mapped view of the corpus, tokenized lazily in __getitem__.
+
+    Rows are deduplicated by title (first occurrence wins; untitled rows are
+    dropped) and, when `require_nonempty_themes_and_tone`, restricted to rows
+    that have both GDELT fields populated. Row selection is computed once as
+    index arrays cached under `cache_dir` and mmap'd by every rank.
+
+    Each item carries the tokenized text plus the raw `political_bias`,
+    `V2Themes` and `V2Tone` values; turning those into task labels is the
+    collators' job, so all four tasks share one instance of this dataset.
     """
 
     def __init__(
@@ -216,18 +64,49 @@ class MemoryEfficientDataset(TorchDataset):
         self.text_col = text_col
 
         state = PartialState()
+        self.dataset = self._load(dataset_name, split, cache_dir, state)
 
-        # All ranks racing into load_dataset hammers the same HF cache_dir and
-        # its filelock; if any rank crashes mid-load it leaves an orphan .lock
-        # that deadlocks the next launch. main_process_first() lets rank 0 warm
-        # (or repair) the cache alone, then the other ranks read it warm.
-        print(
-            f"Loading {dataset_name} with memory mapping (rank={state.process_index})",
-            flush=True,
+        before = len(self.dataset)
+        keep_indices = select_rows(
+            self.dataset,
+            dataset_name=dataset_name,
+            split=split,
+            cache_dir=cache_dir or "./cache",
+            require_nonempty_themes_and_tone=require_nonempty_themes_and_tone,
+            state=state,
         )
+        if keep_indices is not None:
+            self._apply_selection(keep_indices, before, state)
+
+        # Drop columns no task reads, to keep the mapped table small.
+        existing_columns = [
+            col for col in UNUSED_COLUMNS if col in self.dataset.column_names
+        ]
+        if existing_columns:
+            self.dataset = self.dataset.remove_columns(existing_columns)
+
+        if state.is_main_process:
+            print(f"   dataset ready: {len(self.dataset):,} samples", flush=True)
+
+    @staticmethod
+    def _load(
+        dataset_name: str,
+        split: str,
+        cache_dir: Optional[str],
+        state: PartialState,
+    ) -> Dataset:
+        """Memory-map the corpus, letting rank 0 warm the HF cache first.
+
+        All ranks racing into load_dataset hammers the same cache_dir and its
+        filelock; if any rank crashes mid-load it leaves an orphan .lock that
+        deadlocks the next launch. main_process_first() lets rank 0 warm (or
+        repair) the cache alone, then the other ranks read it warm.
+        """
+        if state.is_main_process:
+            print(f"   loading {dataset_name} (memory-mapped)", flush=True)
         t = time.perf_counter()
         with state.main_process_first():
-            dataset_raw = load_dataset(
+            dataset = load_dataset(
                 dataset_name,
                 split=split,
                 revision="refs/convert/parquet",
@@ -235,122 +114,58 @@ class MemoryEfficientDataset(TorchDataset):
                 cache_dir=cache_dir,
                 keep_in_memory=False,
             )
-        print(
-            f"   [load_dataset] rank={state.process_index} returned in "
-            f"{time.perf_counter() - t:.1f}s",
-            flush=True,
-        )
+        if state.is_main_process:
+            print(f"   loaded in {time.perf_counter() - t:.1f}s", flush=True)
 
-        if isinstance(dataset_raw, Dataset):
-            self.dataset = dataset_raw
-        else:
-            raise ValueError(f"Expected Dataset, got {type(dataset_raw)}")
+        if not isinstance(dataset, Dataset):
+            raise ValueError(f"Expected Dataset, got {type(dataset)}")
+        return dataset
 
-        # Row selection is computed as index arrays first and applied as a single
-        # select + flatten_indices at the end, so the expensive Arrow rewrite is
-        # paid once no matter how many filters are active.
-        before = len(self.dataset)
-        keep_indices: Optional[np.ndarray] = None
+    def _apply_selection(
+        self, keep_indices: np.ndarray, before: int, state: PartialState
+    ) -> None:
+        """Narrow the table to `keep_indices` and materialize the result.
 
-        if require_nonempty_themes_and_tone:
-            filter_cache_path = _filter_index_cache_path(
-                cache_dir=cache_dir or "./cache",
-                dataset_name=dataset_name,
-                split=split,
-                n_rows=before,
-            )
-            keep_indices = _build_or_load_filter_index(
-                self.dataset, filter_cache_path, state
-            )
-            if state.is_main_process:
-                print(
-                    f"🔎 Subsample: {len(keep_indices):,}/{before:,} rows "
-                    f"have non-empty V2Themes and V2Tone",
-                    flush=True,
-                )
-
-        # Deduplicate by title, keeping the first row of each distinct title and
-        # dropping rows with no title at all. Scoped to `keep_indices` so a title
-        # whose first row was dropped by the subsample falls back to its next
-        # surviving row instead of disappearing.
-        if "title" in self.dataset.column_names:
-            title_cache_path = _title_index_cache_path(
-                cache_dir=cache_dir or "./cache",
-                dataset_name=dataset_name,
-                split=split,
-                filtered=require_nonempty_themes_and_tone,
-                n_rows=before,
-            )
-            n_candidates = len(keep_indices) if keep_indices is not None else before
-            keep_indices = _build_or_load_first_title_index(
-                self.dataset, title_cache_path, state, candidate_indices=keep_indices
-            )
-            if state.is_main_process:
-                print(
-                    f"🔎 Dedup: kept {len(keep_indices):,}/{n_candidates:,} rows "
-                    f"with distinct, non-empty titles",
-                    flush=True,
-                )
-        else:
-            print(
-                "   [title-index] No 'title' column found; skipping title dedup",
-                flush=True,
-            )
-
-        if keep_indices is not None:
-            t = time.perf_counter()
-            # `select` writes a per-rank indices-mapping arrow file into the HF
-            # cache_dir; stagger it through main_process_first so rank 0 writes
-            # first and the other ranks pick up the warm cache instead of all
-            # 8 racing to write the same hashed path.
-            with state.main_process_first():
-                self.dataset = self.dataset.select(keep_indices)
-            print(
-                f"   [select] rank={state.process_index} applied row indices in "
-                f"{time.perf_counter() - t:.1f}s",
-                flush=True,
-            )
-            # Materialize the selection into the underlying arrow table so that
-            # `self.dataset.data.column(...)` reflects the selected view, and so
-            # __getitem__ doesn't pay the indices-mapping indirection per row.
-            t = time.perf_counter()
-            with state.main_process_first():
-                self.dataset = self.dataset.flatten_indices()
-            print(
-                f"   [flatten_indices] rank={state.process_index} in "
-                f"{time.perf_counter() - t:.1f}s",
-                flush=True,
-            )
-            if state.is_main_process:
-                print(
-                    f"🔎 Kept {len(self.dataset):,}/{before:,} rows after "
-                    f"filtering and title dedup",
-                    flush=True,
-                )
-
-        # Remove columns we don't need to save memory
+        Both selection rules are resolved into one index array first, so this
+        Arrow rewrite -- the expensive part -- is paid exactly once.
+        """
         t = time.perf_counter()
-        columns_to_remove = ["source", "title", "html", "url", "date", "group_uid"]
-        existing_columns = [
-            col for col in columns_to_remove if col in self.dataset.column_names
-        ]
-        if existing_columns:
-            self.dataset = self.dataset.remove_columns(existing_columns)
-        print(f"   [remove_columns] in {time.perf_counter() - t:.1f}s", flush=True)
-
-        print(f" Memory-mapped dataset ready: {len(self.dataset):,} samples", flush=True)
+        # `select` writes a per-rank indices-mapping arrow file into the HF
+        # cache_dir; stagger it through main_process_first so rank 0 writes
+        # first and the other ranks pick up the warm cache instead of all
+        # 8 racing to write the same hashed path.
+        with state.main_process_first():
+            self.dataset = self.dataset.select(keep_indices)
+        # Materialize the selection into the underlying arrow table so that
+        # `self.dataset.data.column(...)` reflects the selected view, and so
+        # __getitem__ doesn't pay the indices-mapping indirection per row.
+        with state.main_process_first():
+            self.dataset = self.dataset.flatten_indices()
+        if state.is_main_process:
+            print(
+                f"   selected {len(self.dataset):,}/{before:,} rows "
+                f"(subsample + title dedup) in {time.perf_counter() - t:.1f}s",
+                flush=True,
+            )
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        """Load and tokenize a single sample from memory-mapped storage."""
-        sample = self.dataset[idx]
+        """Tokenize one row on demand.
 
-        # Extract text - sample is a dict-like object
+        Deliberately padded to the full 512 rather than dynamically per batch:
+        every step then costs the same regardless of article length, which keeps
+        the 8 DDP ranks in lockstep and makes the step-time ETA meaningful. It
+        also means the collators' own padding is a no-op. Switching to
+        `padding=False` here (and dropping the fixed `max_length` in
+        `_triplet_utils.pack_triplets`) would buy throughput on short articles,
+        at the cost of variable step times -- worth doing as its own change,
+        not silently.
+        """
+        sample = self.dataset[idx]
         text = sample.get(self.text_col, "")
 
-        # Tokenize on-demand
         tokenized = self.tokenizer(
             text, truncation=True, padding="max_length", return_attention_mask=True
         )
@@ -369,18 +184,18 @@ def build_dataloaders(
     args: TrainArgs,
     tasks_to_build: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
-    """
-    Build dataloaders with lazy loading - no pre-tokenization or RAM loading.
+    """One dataloader per task, all wrapping a single lazily-tokenized dataset.
 
-    Pass `tasks_to_build` to skip loaders not needed for the current run. Task names:
-      - "mlm", "tone", "themes"
-      - "triplet" (random sampler, ideology mining)
+    Every loader shuffles independently, so each training step shows the four
+    objectives four different random subsets of the same corpus. Pass
+    `tasks_to_build` ("mlm", "tone", "triplet", "themes") to skip loaders the
+    current run doesn't need.
     """
-    print(" Building memory-efficient dataloaders with lazy loading...")
-
     tasks = set(tasks_to_build) if tasks_to_build is not None else {
         "mlm", "tone", "triplet", "themes",
     }
+
+    _login_once(PartialState())
 
     dataloaders: Dict[str, Any] = {}
 
@@ -395,8 +210,7 @@ def build_dataloaders(
         "prefetch_factor": 2,
     }
 
-    print("   Creating lazy datasets...")
-    mlm_dataset = MemoryEfficientDataset(
+    dataset = MemoryEfficientDataset(
         dataset_name=task_spec.dataset_name,
         split=task_spec.split,
         text_col=task_spec.text_col,
@@ -405,54 +219,53 @@ def build_dataloaders(
         require_nonempty_themes_and_tone=task_spec.require_nonempty_themes_and_tone,
     )
 
-    print("   Building dataloaders...")
-
     if "mlm" in tasks:
         dataloaders["mlm"] = build_lazy_mlm_dataloader(
-            tok, args, mlm_dataset, **loader_params
+            tok, task_spec, args, dataset, **loader_params
         )
     if "tone" in tasks:
         dataloaders["tone"] = build_lazy_regression_dataloader(
-            tok, task_spec, args, mlm_dataset, **loader_params
+            args, dataset, **loader_params
         )
     if "triplet" in tasks:
         dataloaders["triplet"] = build_lazy_triplet_dataloader(
-            tok, task_spec, args, mlm_dataset, **loader_params
+            task_spec, args, dataset, **loader_params
         )
     if "themes" in tasks:
         dataloaders["themes"] = build_lazy_multilabel_dataloader(
-            tok, task_spec, args, mlm_dataset, **loader_params
+            task_spec, args, dataset, **loader_params
         )
 
-    print("    All lazy dataloaders built")
     return dataloaders
 
 
-
 # ------------------------------
-# Lazy Dataloaders for each task
+# One dataloader per task, all over the same MemoryEfficientDataset
 # ------------------------------
 
 
 def build_lazy_mlm_dataloader(
-    tok: PreTrainedTokenizer, args: TrainArgs, dataset: TorchDataset, **loader_kwargs
+    tok: PreTrainedTokenizer,
+    spec: TaskSpec,
+    args: TrainArgs,
+    dataset: TorchDataset,
+    **loader_kwargs,
 ) -> DataLoader:
-    """Build MLM dataloader with lazy loading."""
+    """Masked-LM batches; drops the label columns the MLM collator doesn't expect."""
     base_collator = DataCollatorForLanguageModeling(
-        tokenizer=tok, mlm=True, mlm_probability=0.15
+        tokenizer=tok, mlm=True, mlm_probability=spec.mlm_probability
     )
 
-    # Wrapper to filter batch before passing to MLM collator
     def filtered_collator(batch):
-        # Filter to only include MLM-relevant fields
-        filtered_batch = []
-        for item in batch:
-            filtered_item = {
-                "input_ids": item["input_ids"],
-                "attention_mask": item["attention_mask"],
-            }
-            filtered_batch.append(filtered_item)
-        return base_collator(filtered_batch)
+        return base_collator(
+            [
+                {
+                    "input_ids": item["input_ids"],
+                    "attention_mask": item["attention_mask"],
+                }
+                for item in batch
+            ]
+        )
 
     return DataLoader(
         dataset,
@@ -464,181 +277,47 @@ def build_lazy_mlm_dataloader(
 
 
 def build_lazy_triplet_dataloader(
-    tok: PreTrainedTokenizer,
-    spec: TaskSpec,
-    args: TrainArgs,
-    dataset: TorchDataset,
-    **loader_kwargs,
+    spec: TaskSpec, args: TrainArgs, dataset: TorchDataset, **loader_kwargs
 ) -> DataLoader:
-    """Build triplet dataloader with lazy loading."""
-    base_collator = TripletDataCollator(
-        triplet_downsample_size=spec.max_triplet_samples
-    )
-
+    """Triplets mined within each batch from the political_bias column."""
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=base_collator,
+        collate_fn=TripletDataCollator(
+            triplet_downsample_size=spec.max_triplet_samples
+        ),
         **loader_kwargs,
     )
 
 
 def build_lazy_multilabel_dataloader(
-    tok: PreTrainedTokenizer,
-    spec: TaskSpec,
-    args: TrainArgs,
-    dataset: TorchDataset,
-    **loader_kwargs,
+    spec: TaskSpec, args: TrainArgs, dataset: TorchDataset, **loader_kwargs
 ) -> Optional[DataLoader]:
-    """Build multilabel dataloader with lazy loading."""
-    if spec.multi_label_col is None or spec.themes_path is None:
-        return None
+    """Multi-hot theme labels over the top_themes.txt label space.
 
-    collator = MultiLabelCollator(top_themes_path=spec.themes_path)
+    Returns None when the run has no theme label space configured.
+    """
+    if spec.themes_path is None:
+        return None
 
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=collator,
+        collate_fn=MultiLabelCollator(top_themes_path=spec.themes_path),
         **loader_kwargs,
     )
 
 
 def build_lazy_regression_dataloader(
-    tok: PreTrainedTokenizer,
-    spec: TaskSpec,
-    args: TrainArgs,
-    dataset: TorchDataset,
-    **loader_kwargs,
-) -> Optional[DataLoader]:
-    """Build regression dataloader with lazy loading."""
-    collator = RegressionCollator(output_size=1)
-
+    args: TrainArgs, dataset: TorchDataset, **loader_kwargs
+) -> DataLoader:
+    """Tone regression targets: the first field of GDELT V2Tone (average tone)."""
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=collator,
+        collate_fn=RegressionCollator(output_size=1),
         **loader_kwargs,
     )
-
-
-# ------------------------------
-# Original Dataloaders (for compatibility)
-# ------------------------------
-
-
-def build_mlm_dataloader(
-    tok: PreTrainedTokenizer,
-    spec: TaskSpec,
-    args: TrainArgs,
-    ds: Dataset,
-    **loader_kwargs,
-) -> DataLoader:
-    """Build MLM dataloader."""
-    collator = DataCollatorForLanguageModeling(
-        tokenizer=tok, mlm=True, mlm_probability=spec.mlm_probability
-    )
-
-    # Use optimized parameters or fallback to args
-    pin_memory = loader_kwargs.get("pin_memory", args.pin_memory)
-
-    dl = DataLoader(
-        ds,  # type: ignore
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collator,
-        pin_memory=pin_memory,
-        persistent_workers=loader_kwargs.get("persistent_workers", False),
-        prefetch_factor=loader_kwargs.get("prefetch_factor", 2),
-    )
-    return dl
-
-
-def build_triplet_dataloader(
-    tok: PreTrainedTokenizer,
-    spec: TaskSpec,
-    args: TrainArgs,
-    ds: Dataset,
-    **loader_kwargs,
-) -> DataLoader:
-    """Build triplet dataloader."""
-    collator = TripletDataCollator(triplet_downsample_size=spec.max_triplet_samples)
-
-    # Use optimized parameters or fallback to args
-    num_workers = loader_kwargs.get("num_workers", args.dataloader_num_workers)
-    pin_memory = loader_kwargs.get("pin_memory", args.pin_memory)
-
-    dl = DataLoader(
-        ds,  # type: ignore
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collator,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=loader_kwargs.get("persistent_workers", False),
-        prefetch_factor=loader_kwargs.get("prefetch_factor", 2),
-    )
-    return dl
-
-
-def build_multilabel_dataloader(
-    tok: PreTrainedTokenizer,
-    spec: TaskSpec,
-    args: TrainArgs,
-    ds: Dataset,
-    **loader_kwargs,
-) -> Optional[DataLoader]:
-    """Build multilabel dataloader."""
-    if spec.multi_label_col is None or spec.themes_path is None:
-        print(
-            "No multilabel column or themes path specified; skipping multilabel dataloader."
-        )
-        return None
-
-    collator = MultiLabelCollator(top_themes_path=spec.themes_path)
-
-    # Use optimized parameters or fallback to args
-    num_workers = loader_kwargs.get("num_workers", args.dataloader_num_workers)
-    pin_memory = loader_kwargs.get("pin_memory", args.pin_memory)
-
-    dl = DataLoader(
-        ds,  # type: ignore
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collator,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=loader_kwargs.get("persistent_workers", False),
-        prefetch_factor=loader_kwargs.get("prefetch_factor", 2),
-    )
-    return dl
-
-
-def build_regression_dataloader(
-    tok, spec: TaskSpec, args: TrainArgs, ds: Dataset, **loader_kwargs
-) -> Optional[DataLoader]:
-    """Build regression dataloader with RTX 5090 optimizations."""
-    if spec.regression_col is None:
-        print("No regression column specified; skipping regression dataloader.")
-        return None
-
-    collator = RegressionCollator()
-
-    # Use optimized parameters or fallback to args
-    num_workers = loader_kwargs.get("num_workers", args.dataloader_num_workers)
-    pin_memory = loader_kwargs.get("pin_memory", args.pin_memory)
-
-    dl = DataLoader(
-        ds,  # type: ignore
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collator,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=loader_kwargs.get("persistent_workers", False),
-        prefetch_factor=loader_kwargs.get("prefetch_factor", 2),
-    )
-    return dl

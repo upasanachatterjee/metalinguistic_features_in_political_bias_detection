@@ -1,14 +1,13 @@
-from transformers import set_seed
-from .ds_utils import clean_dataset_optimized
+from .preprocessing import clean_dataset_optimized
 from datasets import load_dataset
-from .model_utils import load_model, get_model_name, BERT, BART, ROBERTA, POLITICS
+from .models import load_model, get_model_name
 
 import json
 import os
 import shutil
 import gc
 import torch
-from .trainer_utils import (
+from .metrics import (
     compute_metrics,
     batched_predict_metrics_trainer,
     CustomTrainer,
@@ -16,11 +15,17 @@ from .trainer_utils import (
 from model import MultiTaskRoberta
 
 from datasets import DatasetDict
-from transformers import TrainingArguments, Trainer, EarlyStoppingCallback
+from transformers import (
+    EarlyStoppingCallback,
+    Trainer,
+    TrainingArguments,
+    set_seed,
+)
 from typing import Optional
 from dataclasses import dataclass
 
-set_seed(42)
+
+SEED = 42
 
 
 @dataclass
@@ -32,8 +37,6 @@ class ExperimentConfig:
 
 @dataclass
 class DatasetConfig:
-    sentiment: bool = False
-    no_undersampling: bool = False
     custom_dataset: Optional[str] = None
 
 
@@ -43,6 +46,10 @@ _BATCH_SIZE = 128
 _GRAD_ACCUMULATION = 64
 _NUM_WORKERS = 8
 _EVAL_BATCH_SIZE = 128
+# Articles are truncated, not chunked, so this is the whole input a model sees.
+_MAX_LENGTH = 512
+# Tokenization/undersampling workers for datasets.map; tuned for the training box.
+_NUM_PROC = 24
 
 
 def remove_int_bias_1(example):
@@ -62,62 +69,42 @@ def cleanup():
         torch.cuda.empty_cache()
 
 
-def get_cleaned_dataset(
-    dataset,
-    tokenizer,
-    sentiments,
-    max_length,
-    no_undersampling=False,
-    model=None,
-):
+def get_cleaned_dataset(dataset, tokenizer, model):
+    """Clean and tokenize all three splits.
+
+    Only the training split is undersampled -- balancing test or validation
+    would change what the reported numbers mean. Column names follow
+    MultiTaskRoberta's `bias_*` convention when that is the model being trained.
+    """
     use_bias_keys = isinstance(model, MultiTaskRoberta)
 
-    training_dataset = clean_dataset_optimized(
-        dataset["train"],
-        tokenizer=tokenizer,
-        num_proc=24,
-        sentiments=sentiments,
-        max_length=max_length,
-        skip_undersampling=no_undersampling,
-        use_bias_keys=use_bias_keys,
-    )
-    test_dataset = clean_dataset_optimized(
-        dataset["test"],
-        tokenizer=tokenizer,
-        num_proc=24,
-        sentiments=sentiments,
-        max_length=max_length,
-        skip_undersampling=True,
-        use_bias_keys=use_bias_keys,
-    )
-    validation_dataset = clean_dataset_optimized(
-        dataset["validation"],
-        tokenizer=tokenizer,
-        num_proc=24,
-        sentiments=sentiments,
-        max_length=max_length,
-        skip_undersampling=True,
-        use_bias_keys=use_bias_keys,
+    def prepare(split: str, skip_undersampling: bool):
+        return clean_dataset_optimized(
+            dataset[split],
+            tokenizer=tokenizer,
+            num_proc=_NUM_PROC,
+            max_length=_MAX_LENGTH,
+            skip_undersampling=skip_undersampling,
+            use_bias_keys=use_bias_keys,
+        )
+
+    return (
+        prepare("train", False),
+        prepare("test", True),
+        prepare("validation", True),
     )
 
-    return training_dataset, test_dataset, validation_dataset
+
+def make_experiment_name(model_name: str) -> str:
+    """Directory/file stem for one run. The 'baseline_trunc' segment is kept so
+    the names line up with results produced before theme-conditioned and
+    whole-article variants were dropped."""
+    return f"{model_name}_baseline_trunc"
 
 
-def make_experiment_name(
-    model_name: str, theme: Optional[str], trunc: bool, sentiment: bool
-) -> str:
-    text_mode = "trunc" if trunc else "batch"
-    sent_mode = "sentiment" if sentiment else "no_sentiment"
-    theme = theme if theme else "baseline"
-    return f"{model_name}_{theme}_{text_mode}_{sent_mode}"
-
-
-def load_and_rename_dataset(sentiment: bool) -> DatasetDict:
-    """
-    Returns a DatasetDict with columns renamed to
-    {'bias'→'int_bias', 'content'→'text', 'ID'→'id'}
-    and a 'validation' split set up.
-    """
+def load_and_rename_dataset() -> DatasetDict:
+    """Default AllSides split, with columns renamed to the names used here
+    ('bias'→'int_bias', 'content'→'text', 'ID'→'id')."""
     path = "upasanachatterjee/allsides_media-splits_sentiments"
     print("loading allsides_media-splits_sentiments")
     ds: DatasetDict = load_dataset(path)
@@ -134,7 +121,6 @@ def run_single(
     model,
     tokenizer,
     ds: DatasetDict,
-    dataset_config: DatasetConfig,
     loc: str,
     experiment_config: Optional[ExperimentConfig] = None,
 ):
@@ -142,41 +128,37 @@ def run_single(
     if experiment_config is None:
         experiment_config = ExperimentConfig()
 
-    # 1) clean & tokenize
-    train, test, validation = get_cleaned_dataset(
-        ds,
-        tokenizer,
-        dataset_config.sentiment,
-        512,
-        dataset_config.no_undersampling,
-        model=model,
-    )
+    train, test, validation = get_cleaned_dataset(ds, tokenizer, model)
 
-    # 2) train & evaluate
-    name = make_experiment_name(model_name, None, True, dataset_config.sentiment)
+    name = make_experiment_name(model_name)
     print(f"Training {name}")
-    metrics_val, metrics_test = train_model(
-        model, train, test, validation, f"{loc}/{name}", model_name, experiment_config
+    metrics_test = train_model(
+        model, train, test, validation, f"{loc}/{name}", experiment_config
     )
 
-    # 3) attach row counts
-    add_row_counts(metrics_test, {"train": train, "test": test})
-    metrics_val["validation_rows"] = count_unique_ids(validation, "validation")
+    add_row_counts(
+        metrics_test, {"train": train, "test": test, "validation": validation}
+    )
 
-    # 4) save
-    metrics_filename = f"{loc}/{name}_test_metrics.json"
-    with open(metrics_filename, "w") as f:
+    with open(f"{loc}/{name}_test_metrics.json", "w") as f:
         json.dump(metrics_test, f, indent=2)
-    return metrics_val, metrics_test
+    return metrics_test
 
 
 def _load_dataset_by_config(dataset_config: DatasetConfig) -> DatasetDict:
+    """Resolve `custom_dataset` to a DatasetDict with int_bias/text/id columns.
+
+    The value is overloaded: it names either a label transform of the default
+    AllSides split ("make_binary", "remove_int_bias_1") or a hub dataset to load
+    instead. Splits that ship without a validation set reuse test, which is only
+    used for early stopping.
+    """
     if dataset_config.custom_dataset == "make_binary":
-        ds = load_and_rename_dataset(dataset_config.sentiment)
+        ds = load_and_rename_dataset()
         for split in ["validation", "train", "test"]:
             ds[split] = ds[split].map(make_binary)
     elif dataset_config.custom_dataset == "remove_int_bias_1":
-        ds = load_and_rename_dataset(dataset_config.sentiment)
+        ds = load_and_rename_dataset()
         for split in ["validation", "train", "test"]:
             ds[split] = ds[split].filter(remove_int_bias_1)
     elif dataset_config.custom_dataset == "mediabiasgroup/BABE":
@@ -190,7 +172,7 @@ def _load_dataset_by_config(dataset_config: DatasetConfig) -> DatasetDict:
     else:
         if dataset_config.custom_dataset:
             print("unsupported action")
-        ds = load_and_rename_dataset(dataset_config.sentiment)
+        ds = load_and_rename_dataset()
     return ds
 
 
@@ -199,13 +181,18 @@ def run_experiment(
     loc: str,
     dataset_config: Optional[DatasetConfig] = None,
     experiment_config: Optional[ExperimentConfig] = None,
-):
-    """Run experiments with configuration objects."""
+) -> dict:
+    """Fine-tune one model on one bias dataset and write its test metrics.
+
+    `model` is a hub name or checkpoint path (see `models.load_model`); `loc` is
+    the directory the metrics JSON lands in. Returns those metrics.
+    """
     if dataset_config is None:
         dataset_config = DatasetConfig()
     if experiment_config is None:
         experiment_config = ExperimentConfig()
 
+    set_seed(SEED)
     model_name = get_model_name(model)
     cleanup()
 
@@ -214,19 +201,16 @@ def run_experiment(
     ds = _load_dataset_by_config(dataset_config)
     tokenizer, model = load_model(model)
 
-    return run_single(
-        model_name, model, tokenizer, ds, dataset_config, loc, experiment_config
-    )
+    return run_single(model_name, model, tokenizer, ds, loc, experiment_config)
 
 
 def make_training_args(
-    model_name: str,
     output_dir: str = "test_trainer",
     num_epochs: int = 15,
     learning_rate: float = 5e-5,
     batch_size_override: Optional[int] = None,
 ) -> TrainingArguments:
-    """Create training arguments with model-specific configurations."""
+    """Shared HF TrainingArguments for every finetuning run in this study."""
     return TrainingArguments(
         output_dir=output_dir,
         save_strategy="epoch",
@@ -246,7 +230,7 @@ def make_training_args(
         adam_beta2=0.999,
         warmup_ratio=0.06,
         save_safetensors=False,
-        seed=42,
+        seed=SEED,
         remove_unused_columns=False,
     )
 
@@ -260,15 +244,15 @@ def ensure_validation_dataset(test_ds, val_ds):
     raise ValueError("Both validation and test sets are empty")
 
 
-def count_unique_ids(dataset, split_name: str) -> int:
-    """Count unique IDs in a dataset split."""
+def count_unique_ids(dataset) -> int:
+    """Number of distinct article ids, i.e. rows before any per-id aggregation."""
     return len(dataset.to_pandas()["id"].unique()) if dataset else 0
 
 
 def add_row_counts(metrics: dict, datasets: dict) -> None:
     """Add row counts to metrics dictionary."""
     for split_name, dataset in datasets.items():
-        metrics[f"{split_name}_rows"] = count_unique_ids(dataset, split_name)
+        metrics[f"{split_name}_rows"] = count_unique_ids(dataset)
 
 
 def training_args_to_dict(training_args: TrainingArguments, patience: int) -> dict:
@@ -312,12 +296,12 @@ def make_trainer(
     )
 
 
-def evaluate_and_cleanup(trainer: Trainer, test_ds, model_name: str):
-    """Evaluate trainer and cleanup resources."""
+def evaluate_and_cleanup(trainer: Trainer, test_ds):
+    """Score the held-out split, then free the GPU before the next run."""
     test_metrics = batched_predict_metrics_trainer(
         trainer, test_ds, batch_size=_EVAL_BATCH_SIZE
     )
-    cleanup()  # your existing gc + torch.cuda.empty_cache
+    cleanup()
     return test_metrics
 
 
@@ -327,13 +311,15 @@ def train_model(
     test_ds,
     val_ds,
     save_name: str,
-    model_name: str,
     experiment_config: ExperimentConfig,
-):
-    """Train model with experiment configuration."""
-    training_args = make_training_args(
-        model_name, num_epochs=experiment_config.num_epochs
-    )
+) -> dict:
+    """Fine-tune on the training split, early-stopping on validation, score on test.
+
+    Returns the test metrics, with the training arguments attached for the
+    record. Validation is only used for model selection, so no metrics from it
+    are reported.
+    """
+    training_args = make_training_args(num_epochs=experiment_config.num_epochs)
     print("per_device_train_batch_size=", training_args.per_device_train_batch_size)
     val_ds = ensure_validation_dataset(test_ds, val_ds)
 
@@ -351,7 +337,8 @@ def train_model(
         trainer.save_model(f"{save_name}/finetuned_model")
     cleanup()
 
-    training_args_dict = training_args_to_dict(training_args, experiment_config.patience)
-    test_metrics = evaluate_and_cleanup(trainer, test_ds, model_name)
-    test_metrics["training_args"] = training_args_dict
-    return {}, test_metrics
+    test_metrics = evaluate_and_cleanup(trainer, test_ds)
+    test_metrics["training_args"] = training_args_to_dict(
+        training_args, experiment_config.patience
+    )
+    return test_metrics
