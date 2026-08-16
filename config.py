@@ -1,27 +1,21 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-import torch
+from typing import List, Optional, Sequence
 import yaml
 from gradient_diagnostics import GradientDiagnosticsConfig
-from huggingface_hub import login
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 
 @dataclass
 class TaskSpec:
+    """Which rows of the corpus each task sees, and how its labels are built."""
+
     dataset_name: str
     split: str = "train"
     text_col: str = "textString"
     # MLM
     mlm_probability: float = 0.15
-    # Multilabel
-    multi_label_col: Optional[str] = (
-        "V2Themes"  # column containing list or string labels
-    )
     themes_path: Optional[str] = None
-    # Regression
-    regression_col: Optional[str] = "V2Tone"  # column containing float target(s)
     max_triplet_samples: int = 16
     # Subsampling: drop rows where V2Themes or V2Tone is missing/empty
     require_nonempty_themes_and_tone: bool = False
@@ -70,10 +64,11 @@ class LossWeights:
 
 @dataclass
 class RunConfig:
+    """Schema of a run_configs/*.yaml file — one file per pretraining run."""
+
     output_dir: str
     tasks: List[str] = field(default_factory=lambda: ["triplet", "mlm"])
     theme_count: int = 2000
-    tone_count: int = 2
     base_lr: float = 5e-5
     init_from_checkpoint: Optional[str] = None
     train_args: TrainArgs = field(default_factory=TrainArgs)
@@ -85,8 +80,8 @@ class RunConfig:
         )
     )
     loss_weights: LossWeights = field(default_factory=LossWeights)
-    # Temporary multi-task gradient diagnostic; disabled by default so normal
-    # training behaviour is unchanged.
+    # Multi-task gradient diagnostic; disabled by default so normal training
+    # behaviour is unchanged.
     gradient_diagnostics: GradientDiagnosticsConfig = field(
         default_factory=GradientDiagnosticsConfig
     )
@@ -108,82 +103,62 @@ def load_run_config(path: str) -> RunConfig:
     )
 
 
-def login_to_huggingface(token):
-    login(token)
-    print("Logged in to Hugging Face Hub")
+@dataclass
+class TrainingProgress:
+    """Wall-clock progress for one logging interval.
+
+    Durations come pre-formatted for printing; `elapsed_seconds` is the raw
+    value, for the TSV.
+    """
+
+    elapsed: str
+    elapsed_seconds: float
+    eta: str
+    epoch_eta: str
+    epoch_pct: float
+    steps_per_second: float
 
 
-def update_loss(
-    loss_item: Optional[torch.Tensor], global_loss: Optional[torch.Tensor]
-) -> torch.Tensor | None:
-    """Helper to update global loss with a new loss item."""
-    if loss_item is not None:
-        if global_loss is None:
-            return loss_item
-        else:
-            return global_loss + loss_item
-    return global_loss
-
-
-def calculate_eta(
+def training_progress(
     training_start_time: float,
     epoch_start_time: float,
-    step_times: List[float],
+    step_times: Sequence[float],
     step: int,
     steps_in_current_epoch: int,
     max_steps_per_epoch: int,
-    TOTAL_STEPS: int,
-    avg_step_time: float,
-    batch_size: int,
-    num_processes: int,
-) -> Tuple[str, str, str, str, float, float, float, float, float]:
-    """Calculate estimated time of arrival (completion) for training."""
-    # Calculate timing statistics
-    current_time = time.time()
-    elapsed_time = current_time - training_start_time
-    elapsed_str = str(timedelta(seconds=int(elapsed_time)))
+    total_steps: int,
+) -> TrainingProgress:
+    """Estimate remaining time from recent step durations.
 
-    # Calculate ETC based on recent step times
-    if len(step_times) >= 5:  # Need at least 5 steps for reliable estimate
+    The run-level ETA needs at least 5 recorded steps and the epoch ETA needs 1%
+    of the epoch done; both report "..." until then.
+    """
+    now = time.time()
+    elapsed_seconds = now - training_start_time
+    elapsed = str(timedelta(seconds=int(elapsed_seconds)))
+
+    if len(step_times) >= 5:
         avg_step_time = sum(step_times) / len(step_times)
-        remaining_steps = TOTAL_STEPS - step
-        eta_seconds = remaining_steps * avg_step_time
-        eta_str = str(timedelta(seconds=int(eta_seconds)))
-        completion_time = datetime.now() + timedelta(seconds=eta_seconds)
-        completion_str = completion_time.strftime("%Y-%m-%d %H:%M:%S")
+        eta = str(timedelta(seconds=int((total_steps - step) * avg_step_time)))
+        steps_per_second = 1.0 / avg_step_time if avg_step_time > 0 else 0.0
     else:
-        eta_str = "Calculating..."
-        completion_str = "Calculating..."
+        eta = "..."
+        steps_per_second = 0.0
 
-    # Calculate epoch ETC
-    epoch_elapsed = current_time - epoch_start_time
+    epoch_elapsed = now - epoch_start_time
     epoch_progress = steps_in_current_epoch / max_steps_per_epoch
-    if epoch_progress > 0.01:  # Avoid division by very small numbers
-        epoch_eta_seconds = (epoch_elapsed / epoch_progress) - epoch_elapsed
-        epoch_eta_str = str(timedelta(seconds=int(epoch_eta_seconds)))
+    if epoch_progress > 0.01:  # Avoid dividing by a near-zero fraction
+        epoch_eta = str(
+            timedelta(seconds=int((epoch_elapsed / epoch_progress) - epoch_elapsed))
+        )
     else:
-        epoch_eta_str = "Calculating..."
+        epoch_eta = "..."
 
-    # Calculate steps per second
-    if len(step_times) >= 5 and avg_step_time > 0:
-        steps_per_second = 1.0 / avg_step_time
-        samples_per_second = steps_per_second * batch_size * num_processes
-    else:
-        steps_per_second = 0
-        samples_per_second = 0
-
-    progress_pct = (step / TOTAL_STEPS) * 100
-    epoch_progress = steps_in_current_epoch / max_steps_per_epoch
-    epoch_progress_pct = epoch_progress * 100
-
-    return (
-        eta_str,
-        completion_str,
-        elapsed_str,
-        epoch_eta_str,
-        progress_pct,
-        epoch_progress_pct,
-        steps_per_second,
-        samples_per_second,
-        avg_step_time,
+    return TrainingProgress(
+        elapsed=elapsed,
+        elapsed_seconds=elapsed_seconds,
+        eta=eta,
+        epoch_eta=epoch_eta,
+        epoch_pct=epoch_progress * 100,
+        steps_per_second=steps_per_second,
     )

@@ -7,23 +7,22 @@ from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader, Dataset as TorchDataset
 from config import TaskSpec, TrainArgs
 from row_selection import select_rows
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.tokenization_utils import PreTrainedTokenizer
+from collators.multi_task_collator import CollateFn, MultiTaskCollator
 from collators.triplet_collator import TripletDataCollator
 from collators.multi_label_collator import MultiLabelCollator
 from collators.regression_collator import RegressionCollator
+
+TASK_ORDER = ("mlm", "tone", "triplet", "themes")
 
 # Metadata columns no task reads; dropped to keep the mapped table small.
 UNUSED_COLUMNS = ["source", "title", "html", "url", "date", "group_uid"]
 
 
 def _login_once(state: PartialState) -> None:
-    """Authenticate rank 0 before any rank touches the Hub.
-
-    The corpus is a private dataset, so this has to happen before
-    `load_dataset`. Logging in from every rank at once races on the same token
-    file, hence the rank-0 gate and the barrier.
+    """Authenticate to GH.
     """
     if state.is_main_process:
         token = os.getenv("hf_token")
@@ -178,37 +177,25 @@ class MemoryEfficientDataset(TorchDataset):
         }
 
 
-def build_dataloaders(
+def build_dataloader(
     tok: PreTrainedTokenizer,
     task_spec: TaskSpec,
     args: TrainArgs,
     tasks_to_build: Optional[Iterable[str]] = None,
-) -> Dict[str, Any]:
-    """One dataloader per task, all wrapping a single lazily-tokenized dataset.
+) -> Tuple[DataLoader, List[str]]:
+    """One shuffled dataloader feeding every objective the same rows.
 
-    Every loader shuffles independently, so each training step shows the four
-    objectives four different random subsets of the same corpus. Pass
-    `tasks_to_build` ("mlm", "tone", "triplet", "themes") to skip loaders the
-    current run doesn't need.
+    A single `MultiTaskCollator` runs each active task's collator over the same
+    batch of rows, so one training step shows all four objectives one shared
+    random subset of the corpus.
+
+    Pass `tasks_to_build` ("mlm", "tone", "triplet", "themes") to skip the
+    objectives the current run doesn't need. Returns the loader and the tasks it
+    actually collates.
     """
-    tasks = set(tasks_to_build) if tasks_to_build is not None else {
-        "mlm", "tone", "triplet", "themes",
-    }
+    requested = set(tasks_to_build) if tasks_to_build is not None else set(TASK_ORDER)
 
     _login_once(PartialState())
-
-    dataloaders: Dict[str, Any] = {}
-
-    # Keep per-rank worker fanout low. With 8 ranks, num_workers=8 across 4 loaders
-    # can fork hundreds of children whose COW heaps plus pinned buffers overrun
-    # host RAM. Tokenization on roberta-base is cheap relative to fwd/bwd, so
-    # 2 workers per loader is plenty.
-    loader_params = {
-        "num_workers": 2,
-        "pin_memory": True,
-        "persistent_workers": False,
-        "prefetch_factor": 2,
-    }
 
     dataset = MemoryEfficientDataset(
         dataset_name=task_spec.dataset_name,
@@ -219,44 +206,47 @@ def build_dataloaders(
         require_nonempty_themes_and_tone=task_spec.require_nonempty_themes_and_tone,
     )
 
-    if "mlm" in tasks:
-        dataloaders["mlm"] = build_lazy_mlm_dataloader(
-            tok, task_spec, args, dataset, **loader_params
-        )
-    if "tone" in tasks:
-        dataloaders["tone"] = build_lazy_regression_dataloader(
-            args, dataset, **loader_params
-        )
-    if "triplet" in tasks:
-        dataloaders["triplet"] = build_lazy_triplet_dataloader(
-            task_spec, args, dataset, **loader_params
-        )
-    if "themes" in tasks:
-        dataloaders["themes"] = build_lazy_multilabel_dataloader(
-            task_spec, args, dataset, **loader_params
-        )
+    builders: Dict[str, Callable[[], Optional[CollateFn]]] = {
+        "mlm": lambda: build_mlm_collator(tok, task_spec),
+        "tone": lambda: RegressionCollator(output_size=1),
+        "triplet": lambda: TripletDataCollator(
+            triplet_downsample_size=task_spec.max_triplet_samples
+        ),
+        "themes": lambda: (
+            None
+            if task_spec.themes_path is None
+            else MultiLabelCollator(top_themes_path=task_spec.themes_path)
+        ),
+    }
 
-    return dataloaders
+    sub_collators: Dict[str, CollateFn] = {}
+    for task_name in TASK_ORDER:
+        if task_name not in requested:
+            continue
+        collator = builders[task_name]()
+        if collator is not None:
+            sub_collators[task_name] = collator
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=MultiTaskCollator(sub_collators),
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=False,
+        prefetch_factor=2,
+    )
+    return dataloader, list(sub_collators)
 
 
-# ------------------------------
-# One dataloader per task, all over the same MemoryEfficientDataset
-# ------------------------------
-
-
-def build_lazy_mlm_dataloader(
-    tok: PreTrainedTokenizer,
-    spec: TaskSpec,
-    args: TrainArgs,
-    dataset: TorchDataset,
-    **loader_kwargs,
-) -> DataLoader:
+def build_mlm_collator(tok: PreTrainedTokenizer, spec: TaskSpec) -> CollateFn:
     """Masked-LM batches; drops the label columns the MLM collator doesn't expect."""
     base_collator = DataCollatorForLanguageModeling(
         tokenizer=tok, mlm=True, mlm_probability=spec.mlm_probability
     )
 
-    def filtered_collator(batch):
+    def filtered_collator(batch: List[Dict[str, Any]]):
         return base_collator(
             [
                 {
@@ -267,57 +257,4 @@ def build_lazy_mlm_dataloader(
             ]
         )
 
-    return DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=filtered_collator,
-        **loader_kwargs,
-    )
-
-
-def build_lazy_triplet_dataloader(
-    spec: TaskSpec, args: TrainArgs, dataset: TorchDataset, **loader_kwargs
-) -> DataLoader:
-    """Triplets mined within each batch from the political_bias column."""
-    return DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=TripletDataCollator(
-            triplet_downsample_size=spec.max_triplet_samples
-        ),
-        **loader_kwargs,
-    )
-
-
-def build_lazy_multilabel_dataloader(
-    spec: TaskSpec, args: TrainArgs, dataset: TorchDataset, **loader_kwargs
-) -> Optional[DataLoader]:
-    """Multi-hot theme labels over the top_themes.txt label space.
-
-    Returns None when the run has no theme label space configured.
-    """
-    if spec.themes_path is None:
-        return None
-
-    return DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=MultiLabelCollator(top_themes_path=spec.themes_path),
-        **loader_kwargs,
-    )
-
-
-def build_lazy_regression_dataloader(
-    args: TrainArgs, dataset: TorchDataset, **loader_kwargs
-) -> DataLoader:
-    """Tone regression targets: the first field of GDELT V2Tone (average tone)."""
-    return DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=RegressionCollator(output_size=1),
-        **loader_kwargs,
-    )
+    return filtered_collator
