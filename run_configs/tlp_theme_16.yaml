@@ -7,7 +7,6 @@ train_args:
   batch_size: 32
   warmup_ratio: 0.06
   gradient_accumulation_steps: 8 
-  log_every: 500
 task_spec:
   dataset_name: upasanachatterjee/bignewsalign-with-gdelt
   themes_path: top_themes.txt

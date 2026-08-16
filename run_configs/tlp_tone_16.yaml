@@ -6,7 +6,6 @@ train_args:
   num_epochs: 1
   batch_size: 32
   warmup_ratio: 0.06
-  log_every: 500
   gradient_accumulation_steps: 8 
 task_spec:
   dataset_name: upasanachatterjee/bignewsalign-with-gdelt

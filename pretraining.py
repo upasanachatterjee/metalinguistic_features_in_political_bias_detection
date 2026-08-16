@@ -232,6 +232,7 @@ def prepare_run(cfg: RunConfig, accelerator: Accelerator) -> Tuple[PreparedRun, 
     max_steps_per_epoch = steps_per_epoch // (
         accelerator.num_processes * args.gradient_accumulation_steps
     )
+    args.log_every = max_steps_per_epoch // 15 if args.log_every is None else args.log_every
     total_steps = args.num_epochs * max_steps_per_epoch
     if args.max_steps is not None:
         if args.max_steps > total_steps:
@@ -245,10 +246,11 @@ def prepare_run(cfg: RunConfig, accelerator: Accelerator) -> Tuple[PreparedRun, 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.base_lr, weight_decay=0.01, fused=True
     )
+    schedule_scale = accelerator.num_processes
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=int(total_steps * args.warmup_ratio),
-        num_training_steps=total_steps,
+        num_warmup_steps=int(total_steps * args.warmup_ratio) * schedule_scale,
+        num_training_steps=total_steps * schedule_scale,
     )
 
     dataloader = accelerator.prepare(dataloader)
