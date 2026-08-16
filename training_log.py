@@ -29,11 +29,6 @@ from config import TrainingProgress
 class TrainingLogger:
     """Writes ``training_log.txt`` and ``losses.tsv`` for one run.
 
-    Both files are truncated on construction. Diagnostic-only runs do no
-    training, so they pass ``enabled=False`` to leave an earlier run's logs
-    intact; every method then becomes a no-op.
-
-    Only rank 0 should hold one of these.
     """
 
     def __init__(
@@ -85,6 +80,8 @@ class TrainingLogger:
         weighted_losses: Optional[Dict[str, float]] = None,
     ) -> None:
         """Print one interval to stdout and append it to both files."""
+        if not self.enabled:
+            return
         weighted_losses = weighted_losses or {}
         header = (
             f"step {step:,}/{total_steps:,} | epoch {epoch}/{num_epochs} "
@@ -113,9 +110,6 @@ class TrainingLogger:
         for line in block:
             print(line, flush=True)
 
-        if not self.enabled:
-            return
-
         with open(self.txt_path, "a") as handle:
             for line in block:
                 handle.write(line + "\n")
@@ -138,7 +132,8 @@ class TrainingLogger:
 
     def note(self, message: str) -> None:
         """Append a one-off line (epoch boundary, checkpoint) to the text log."""
+        if not self.enabled:
+            return
         print(message, flush=True)
-        if self.enabled:
-            with open(self.txt_path, "a") as handle:
-                handle.write(message + "\n")
+        with open(self.txt_path, "a") as handle:
+            handle.write(message + "\n")

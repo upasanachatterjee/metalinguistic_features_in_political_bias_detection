@@ -1,9 +1,18 @@
 import random
 from typing import Any, Dict, List, Sequence
 
+from accelerate.state import PartialState
+
 from collators._triplet_utils import Triplet, empty_triplet_batch, pack_triplets
 
 OPPOSITE = {"left": "right", "right": "left"}
+
+
+def _log(message: str) -> None:
+    """Print on rank 0 only.
+    """
+    if PartialState().is_main_process:
+        print(message, flush=True)
 
 
 class TripletDataCollator:
@@ -45,7 +54,7 @@ def group_by_bias(
     for item in batch:
         bias = item.get(political_bias_field)
         if not isinstance(bias, str):
-            print(f"Unknown ideology format: {bias!r}; skipping sample")
+            _log(f"Unknown ideology format: {bias!r}; skipping sample")
             continue
         if bias in groups:
             groups[bias].append(item)
@@ -71,7 +80,7 @@ def sample_triplets(
         if len(groups[side]) >= 2 and len(groups[OPPOSITE[side]]) >= 1
     ]
     if not usable:
-        print(
+        _log(
             f"Batch has no usable left/right split: {[len(groups[side]) for side in ('left', 'right')]}"
         )
         return []

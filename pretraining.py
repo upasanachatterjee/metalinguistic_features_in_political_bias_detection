@@ -438,13 +438,13 @@ def train_one_epoch(
     ):
         stepped = False
 
-        with accelerator.accumulate(run.model):
-            batches, batch_iterator = next_batch(batch_iterator, run.dataloader)
-            combined_batch = build_combined_batch(cfg.tasks, batches)
-            if not combined_batch:
-                state.micro_step += 1
-                continue
+        batches, batch_iterator = next_batch(batch_iterator, run.dataloader)
+        combined_batch = build_combined_batch(cfg.tasks, batches)
+        if not combined_batch:
+            state.micro_step += 1
+            continue
 
+        with accelerator.accumulate(run.model):
             outputs = run.model(**combined_batch)
             total_loss = outputs.get("loss")
 
@@ -580,7 +580,10 @@ def main() -> None:
     # A diagnostic-only run does no training, so leave any earlier run's logs
     # alone; the diagnostic writes its own files.
     logger = TrainingLogger(
-        cfg.output_dir, TASKS, summary, enabled=not diagnostic_only
+        cfg.output_dir,
+        TASKS,
+        summary,
+        enabled=accelerator.is_main_process and not diagnostic_only,
     )
     diagnostics = build_diagnostics(cfg, accelerator, run, cli.config)
 
