@@ -44,9 +44,9 @@ task_spec:
 # The thing under test. 1.0 everywhere is the unweighted baseline to compare
 # any candidate weighting against.
 loss_weights:
-  triplet: 1.0
-  themes: 1.0
-  tone: 1.0
+  triplet: 0.30
+  themes: 2.45
+  tone: 0.20
   mlm: 1.0
 gradient_diagnostics:
   enabled: true
