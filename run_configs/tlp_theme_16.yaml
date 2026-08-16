@@ -1,5 +1,5 @@
-output_dir: ./subsample_tlp_triplet_themes_tone_mlm_mtl_ckpt_16
-tasks: [triplet, mlm, tone, themes]
+output_dir: ./subsample_tlp_triplet_themes_mlm_mtl_ckpt_16
+tasks: [triplet, mlm, themes]
 theme_count: 2000
 base_lr: 5.0e-5
 train_args:
