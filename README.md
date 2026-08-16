@@ -22,11 +22,6 @@ Python 3.12. Install torch first, because the right wheel depends on your machin
 ```bash
 python -m venv .venv && source .venv/bin/activate
 
-# On the GPU box (adjust cu124 to your driver):
-pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu124
-# On a laptop, for notebook work only:
-pip install torch==2.11.0
-
 pip install -r requirements.txt
 ```
 
@@ -34,12 +29,15 @@ pip install -r requirements.txt
 
 Every run is described by one YAML file in `run_configs/`.
 
+Set your accelerate configurations by running:
+```bash
+accelerate config
+```
+
 ```bash
 accelerate launch pretraining.py --config run_configs/tlp_tone_16.yaml
 ```
-
-The first launch on a machine will ask Accelerate how many GPUs you have; run
-`accelerate config` once to answer it permanently. To queue every config in
+To queue every config in
 `run_configs/` back to back:
 
 ```bash

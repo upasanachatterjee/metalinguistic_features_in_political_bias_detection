@@ -1,6 +1,9 @@
-import torch.nn as nn
-from transformers import AutoModel, AutoModelForMaskedLM
+from typing import Dict, Optional, Sequence
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoModel, AutoModelForMaskedLM
 
 DEFAULT_LOSS_WEIGHTS = {
     "triplet": 1.0,
@@ -38,9 +41,14 @@ class MultiTaskRoberta(nn.Module):
     carry any subset of the tasks; `pretraining.TASK_BATCH_KEYS` is the mapping
     from collator output to those keys.
 
-    `outputs["<task>_loss"]` is always the RAW, unweighted task loss. Only
-    `outputs["loss"]` applies `loss_weights`.
+    `outputs["<task>_loss"]` is always the RAW, unweighted task loss;
+    `outputs["<task>_weighted_loss"]` is that loss times its `loss_weights`
+    entry, i.e. exactly the term that went into `outputs["loss"]`. Logging and
+    the gradient diagnostic read the raw key, so the numbers stay comparable
+    across weightings.
     """
+
+    TRIPLET_MARGIN = 1.0
 
     def __init__(
         self,
@@ -49,6 +57,7 @@ class MultiTaskRoberta(nn.Module):
         num_themes=2000,
         num_bias_classes=None,
         loss_weights=None,
+        theme_pos_weight: Optional[Sequence[float]] = None,
     ):
         super().__init__()
         self.name = name
@@ -82,9 +91,30 @@ class MultiTaskRoberta(nn.Module):
         # Clean up the temporary model
         del mlm_model
 
+        # Per-class positive weighting inside the theme task. Non-persistent:
+        # it is derived from the training corpus, not learned, so it stays out
+        # of state_dict (which keeps checkpoints loadable by a model configured
+        # without it) while still following the module to its device.
+        if theme_pos_weight is None:
+            self.register_buffer("theme_pos_weight", None, persistent=False)
+        else:
+            weights = torch.as_tensor(theme_pos_weight, dtype=torch.float)
+            if weights.shape != (num_themes,):
+                raise ValueError(
+                    f"theme_pos_weight has shape {tuple(weights.shape)}, expected "
+                    f"({num_themes},) to match the theme head."
+                )
+            self.register_buffer("theme_pos_weight", weights, persistent=False)
+
+        # When True, `forward` also returns detached triplet geometry under
+        # `outputs["triplet_stats"]`. Off during normal training: each entry is
+        # a GPU->CPU sync that the training loop has no use for.
+        self.collect_triplet_stats = False
+
         # Per-task objectives. Stateless, so they carry no state_dict entries.
-        self.triplet_loss_fct = nn.TripletMarginLoss(margin=1.0, p=2)
-        self.theme_loss_fct = nn.BCEWithLogitsLoss()
+        # (Themes use the functional BCE so `theme_pos_weight` can live in the
+        # non-persistent buffer above rather than inside an nn.Module.)
+        self.triplet_loss_fct = nn.TripletMarginLoss(margin=self.TRIPLET_MARGIN, p=2)
         self.tone_loss_fct = nn.MSELoss()
         self.bias_loss_fct = nn.CrossEntropyLoss()
         self.mlm_loss_fct = nn.CrossEntropyLoss()
@@ -135,8 +165,12 @@ class MultiTaskRoberta(nn.Module):
             )
 
             triplet_loss = self.triplet_loss_fct(za, zp, zn)
-            total_loss += self.loss_weights["triplet"] * triplet_loss
+            weighted = self.loss_weights["triplet"] * triplet_loss
+            total_loss += weighted
             outputs["triplet_loss"] = triplet_loss
+            outputs["triplet_weighted_loss"] = weighted
+            if self.collect_triplet_stats:
+                outputs["triplet_stats"] = self._triplet_stats(za, zp, zn)
 
         # --- Classification Tasks (Themes & Tone) ---
         # Theme Task
@@ -147,11 +181,15 @@ class MultiTaskRoberta(nn.Module):
             )
             pooled = self.forward_single(input_ids, attention_mask)
             theme_logits = self.theme_head(pooled)
-            theme_loss = self.theme_loss_fct(
-                theme_logits, kwargs["theme_labels"].float()
+            theme_loss = F.binary_cross_entropy_with_logits(
+                theme_logits,
+                kwargs["theme_labels"].float(),
+                pos_weight=self.theme_pos_weight,
             )
-            total_loss += self.loss_weights["themes"] * theme_loss
+            weighted = self.loss_weights["themes"] * theme_loss
+            total_loss += weighted
             outputs["theme_loss"] = theme_loss
+            outputs["theme_weighted_loss"] = weighted
             outputs["theme_logits"] = theme_logits
 
         # Tone Task
@@ -163,8 +201,10 @@ class MultiTaskRoberta(nn.Module):
             pooled = self.forward_single(input_ids, attention_mask)
             tone_logits = self.tone_head(pooled)
             tone_loss = self.tone_loss_fct(tone_logits, kwargs["tone_labels"].float())
-            total_loss += self.loss_weights["tone"] * tone_loss
+            weighted = self.loss_weights["tone"] * tone_loss
+            total_loss += weighted
             outputs["tone_loss"] = tone_loss
+            outputs["tone_weighted_loss"] = weighted
             outputs["tone_logits"] = tone_logits
 
         # --- Single-Class Classification Task (e.g., Bias/Ideology) ---
@@ -179,8 +219,10 @@ class MultiTaskRoberta(nn.Module):
             pooled = self.forward_single(input_ids, attention_mask)
             bias_logits = self.bias_head(pooled)
             bias_loss = self.bias_loss_fct(bias_logits, kwargs["bias_labels"])
-            total_loss += self.loss_weights["bias"] * bias_loss
+            weighted = self.loss_weights["bias"] * bias_loss
+            total_loss += weighted
             outputs["bias_loss"] = bias_loss
+            outputs["bias_weighted_loss"] = weighted
             outputs["bias_logits"] = bias_logits
 
         # --- MLM Task ---
@@ -203,12 +245,38 @@ class MultiTaskRoberta(nn.Module):
             mlm_loss = self.mlm_loss_fct(
                 prediction_scores.view(-1, prediction_scores.size(-1)), labels.view(-1)
             )
-            total_loss += self.loss_weights["mlm"] * mlm_loss
+            weighted = self.loss_weights["mlm"] * mlm_loss
+            total_loss += weighted
             outputs["mlm_loss"] = mlm_loss
+            outputs["mlm_weighted_loss"] = weighted
             outputs["mlm_logits"] = prediction_scores
 
         outputs["loss"] = total_loss
         return outputs
+
+    def _triplet_stats(
+        self, za: torch.Tensor, zp: torch.Tensor, zn: torch.Tensor
+    ) -> Dict[str, float]:
+        """Geometry behind the triplet loss, for the gradient diagnostic.
+
+        `nn.TripletMarginLoss` reports only `relu(violation).mean()`, which hides
+        why the triplet gradient is noisy: a batch of easy triplets (all
+        violations negative) contributes nothing at all, and one with a handful
+        of active triplets contributes a gradient built from those few. These
+        numbers separate the two cases.
+        """
+        with torch.no_grad():
+            d_pos = F.pairwise_distance(za, zp, p=2)
+            d_neg = F.pairwise_distance(za, zn, p=2)
+            violation = d_pos - d_neg + self.TRIPLET_MARGIN
+            active = violation > 0
+            return {
+                "num_triplets": int(za.shape[0]),
+                "active_fraction": float(active.float().mean().item()),
+                "mean_positive_distance": float(d_pos.mean().item()),
+                "mean_negative_distance": float(d_neg.mean().item()),
+                "mean_violation": float(violation.mean().item()),
+            }
 
     def forward_single(self, input_ids, attention_mask):
         """Helper for a single forward pass for non-MLM tasks."""
@@ -231,6 +299,13 @@ class MultiTaskRoberta(nn.Module):
             "num_themes": self.theme_head.out_features,
             "num_tones": self.tone_head.out_features,
             "loss_weights": dict(self.loss_weights),
+            # theme_pos_weight is a non-persistent buffer, so it is not in
+            # state_dict; record it here to keep the checkpoint self-describing.
+            "theme_pos_weight": (
+                self.theme_pos_weight.detach().cpu().tolist()
+                if self.theme_pos_weight is not None
+                else None
+            ),
         }
         if self.num_bias_classes is not None:
             config["num_bias_classes"] = self.num_bias_classes

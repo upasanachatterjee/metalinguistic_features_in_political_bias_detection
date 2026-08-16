@@ -5,14 +5,19 @@ Two files, both written into the run's ``output_dir``:
 ``training_log.txt``  human-readable -- the run summary, then one block per
                       logging interval (progress line + task losses).
 ``losses.tsv``        tidy per-interval losses, the file to plot from. One row
-                      per logging interval, one column per task::
+                      per logging interval, two columns per task::
 
                           import pandas as pd
                           df = pd.read_csv("losses.tsv", sep="\\t")
                           df.plot(x="step", y=["triplet", "mlm", "tone", "themes"])
 
-Losses recorded here are the RAW, unweighted per-task losses (see
+The ``<task>`` columns are the RAW, unweighted per-task losses (see
 ``MultiTaskRoberta.forward``), so they stay comparable across loss weightings.
+The ``<task>_weighted`` columns are those same losses times their
+``loss_weights`` entry -- the contribution each objective actually made to the
+total the optimizer stepped on. Under the default all-1.0 weighting the two are
+identical; when they are not, the raw column says what the objective is doing
+and the weighted column says how much of it the optimizer heard.
 """
 
 import os
@@ -55,7 +60,15 @@ class TrainingLogger:
         with open(self.tsv_path, "w") as handle:
             handle.write(
                 "\t".join(
-                    ["step", "epoch", "lr", "elapsed_s", "steps_per_s", *self.tasks]
+                    [
+                        "step",
+                        "epoch",
+                        "lr",
+                        "elapsed_s",
+                        "steps_per_s",
+                        *self.tasks,
+                        *(f"{task}_weighted" for task in self.tasks),
+                    ]
                 )
                 + "\n"
             )
@@ -69,8 +82,10 @@ class TrainingLogger:
         lr: float,
         progress: TrainingProgress,
         task_losses: Dict[str, float],
+        weighted_losses: Optional[Dict[str, float]] = None,
     ) -> None:
         """Print one interval to stdout and append it to both files."""
+        weighted_losses = weighted_losses or {}
         header = (
             f"step {step:,}/{total_steps:,} | epoch {epoch}/{num_epochs} "
             f"{progress.epoch_pct:5.1f}% | lr {lr:.2e} | "
@@ -80,15 +95,30 @@ class TrainingLogger:
         losses = "  loss  " + "  ".join(
             f"{task}={value:.4f}" for task, value in task_losses.items()
         )
-        print(header, flush=True)
-        print(losses, flush=True)
+        block = [header, losses]
+        # Only worth a second line when a weight is actually doing something;
+        # under the default all-1.0 weighting it would repeat the line above.
+        if any(
+            abs(weighted_losses.get(task, value) - value) > 1e-9
+            for task, value in task_losses.items()
+        ):
+            block.append(
+                "  wtd   "
+                + "  ".join(
+                    f"{task}={weighted_losses[task]:.4f}"
+                    for task in task_losses
+                    if task in weighted_losses
+                )
+            )
+        for line in block:
+            print(line, flush=True)
 
         if not self.enabled:
             return
 
         with open(self.txt_path, "a") as handle:
-            handle.write(header + "\n")
-            handle.write(losses + "\n")
+            for line in block:
+                handle.write(line + "\n")
 
         row: List[str] = [
             str(step),
@@ -99,9 +129,10 @@ class TrainingLogger:
         ]
         # A task with no loss this interval leaves its cell empty rather than 0,
         # so pandas reads it as NaN and the curve breaks instead of dipping.
-        for task in self.tasks:
-            value: Optional[float] = task_losses.get(task)
-            row.append("" if value is None else f"{value:.6f}")
+        for source in (task_losses, weighted_losses):
+            for task in self.tasks:
+                value: Optional[float] = source.get(task)
+                row.append("" if value is None else f"{value:.6f}")
         with open(self.tsv_path, "a") as handle:
             handle.write("\t".join(row) + "\n")
 

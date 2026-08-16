@@ -51,6 +51,10 @@ TASK_LOSS_KEYS = {
     "mlm": "mlm_loss",
 }
 
+TASK_WEIGHTED_LOSS_KEYS = {
+    task: key.replace("_loss", "_weighted_loss") for task, key in TASK_LOSS_KEYS.items()
+}
+
 # Collator output key -> the prefixed key MultiTaskRoberta.forward dispatches on.
 # This mapping IS the contract between collators/ and model.py.
 TASK_BATCH_KEYS = {
@@ -118,6 +122,9 @@ class TrainingState:
     task_losses: Dict[str, List[float]] = field(
         default_factory=lambda: {task: [] for task in TASKS}
     )
+    weighted_losses: Dict[str, List[float]] = field(
+        default_factory=lambda: {task: [] for task in TASKS}
+    )
 
 
 # ------------------------------------------------------------------
@@ -173,8 +180,12 @@ def setup_model(cfg: RunConfig) -> Tuple[MultiTaskRoberta, Dict[str, Any]]:
             "num_bias_classes": saved.get("num_bias_classes", None),
         }
 
+    theme_pos_weight = cfg.theme_loss.pos_weight(head_sizes["num_themes"])
+
     model = MultiTaskRoberta(
-        **head_sizes, loss_weights=cfg.loss_weights.as_dict()
+        **head_sizes,
+        loss_weights=cfg.loss_weights.as_dict(),
+        theme_pos_weight=theme_pos_weight,
     )
 
     if checkpoint is not None:
@@ -285,6 +296,13 @@ def run_summary_lines(
         f"learning rate   : {cfg.base_lr} (warmup {args.warmup_ratio:.0%}, linear decay)",
         f"loss weights    : {cfg.loss_weights.as_dict()}"
         f"{'' if cfg.loss_weights.is_default() else '  [OVERRIDDEN]'}",
+        "theme pos_weight: "
+        + (
+            f"on (max {cfg.theme_loss.max_pos_weight}, "
+            f"from {cfg.theme_loss.stats_path})"
+            if cfg.theme_loss.use_pos_weight
+            else "off"
+        ),
         f"subsampled rows : {spec.require_nonempty_themes_and_tone}",
         f"batching        : one shared loader, {len(run.dataloader.dataset):,} samples, "
         f"{steps_per_epoch:,} steps/epoch (all objectives see the same rows)",
@@ -298,7 +316,10 @@ def run_summary_lines(
 
 
 def build_diagnostics(
-    cfg: RunConfig, accelerator: Accelerator, model: torch.nn.Module, config_path: str
+    cfg: RunConfig,
+    accelerator: Accelerator,
+    run: PreparedRun,
+    config_path: str,
 ) -> Optional[GradientDiagnostics]:
     """Construct the gradient diagnostic, or None when it is disabled.
 
@@ -309,20 +330,24 @@ def build_diagnostics(
         return None
     return GradientDiagnostics(
         accelerator=accelerator,
-        model=model,
+        model=run.model,
         config=cfg.gradient_diagnostics,
         output_dir=cfg.output_dir,
         train_batch_size=cfg.train_args.batch_size,
+        # The tasks the collator actually emits, so a virtual batch where a task
+        # produced nothing still records its (zero) gradient.
+        active_tasks=run.active_tasks,
+        checkpoint=cfg.init_from_checkpoint or "none",
+        theme_loss_config=cfg.theme_loss.as_dict(),
+        seed=SEED,
         # Recorded verbatim in the JSON/TXT so a reader can reproduce the run.
         metadata={
             "config_path": config_path,
-            "seed": SEED,
             "model_name": cfg.train_args.model_name,
             "dataset": cfg.task_spec.dataset_name,
             "tasks": ",".join(cfg.tasks),
             "max_triplet_samples": cfg.task_spec.max_triplet_samples,
             "require_nonempty_themes_and_tone": cfg.task_spec.require_nonempty_themes_and_tone,
-            "init_from_checkpoint": cfg.init_from_checkpoint or "none",
             "base_lr": cfg.base_lr,
         },
     )
@@ -439,6 +464,9 @@ def train_one_epoch(
                         value = outputs.get(loss_key)
                         if value is not None:
                             state.task_losses[task].append(value.item())
+                        weighted = outputs.get(TASK_WEIGHTED_LOSS_KEYS[task])
+                        if weighted is not None:
+                            state.weighted_losses[task].append(weighted.item())
 
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(run.model.parameters(), max_norm=1.0)
@@ -455,9 +483,16 @@ def train_one_epoch(
                 for task, values in state.task_losses.items()
                 if values
             }
+            interval_weighted = {
+                task: sum(values) / len(values)
+                for task, values in state.weighted_losses.items()
+                if values
+            }
             if interval_losses:
                 for task in interval_losses:
                     state.task_losses[task] = []
+                for task in interval_weighted:
+                    state.weighted_losses[task] = []
                 logger.log_interval(
                     step=state.step,
                     epoch=epoch,
@@ -474,6 +509,7 @@ def train_one_epoch(
                         run.total_steps,
                     ),
                     task_losses=interval_losses,
+                    weighted_losses=interval_weighted,
                 )
 
         state.step += 1
@@ -518,7 +554,7 @@ def main() -> None:
     logger = TrainingLogger(
         cfg.output_dir, TASKS, summary, enabled=not diagnostic_only
     )
-    diagnostics = build_diagnostics(cfg, accelerator, run.model, cli.config)
+    diagnostics = build_diagnostics(cfg, accelerator, run, cli.config)
 
     epoch_offset = checkpoint_epoch_offset(cfg.init_from_checkpoint)
     state = TrainingState()

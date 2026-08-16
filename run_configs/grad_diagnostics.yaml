@@ -1,43 +1,39 @@
-# Temporary single-GPU gradient diagnostic run.
+# single-GPU gradient diagnostic
 #
 #   CUDA_VISIBLE_DEVICES=0 accelerate launch \
 #       --num_processes 1 --mixed_precision no \
 #       pretraining.py --config run_configs/grad_diagnostics.yaml
 #
-# batch_size 4 x microbatches_per_virtual_batch 8 = 32 examples per virtual
-# batch, matching the normal 8-GPU global batch of 32.
-#
-# Writes gradient_diagnostics.{txt,tsv,json} into output_dir, and appends the
-# tidy rows to records_path so several runs (varying parameter_scope, batch
-# size or K) can be plotted against each other from one table.
 output_dir: ./grad_diagnostics
 tasks: [triplet, mlm, tone, themes]
 theme_count: 2000
 base_lr: 5.0e-5
 train_args:
   num_epochs: 1
-  batch_size: 4
+  batch_size: 32
   warmup_ratio: 0.06
   log_every: 500
 task_spec:
   dataset_name: upasanachatterjee/bignewsalign-with-gdelt
   themes_path: top_themes.txt
-  max_triplet_samples: 4
+  max_triplet_samples: 16
   require_nonempty_themes_and_tone: True
-# PLACEHOLDERS: 1.0 everywhere == the original unweighted sum. After the
-# diagnostic run, replace these with the "rounded" column it prints (it emits a
-# ready-to-paste block). Keep this run at 1.0 so the measurement is unweighted.
+# PLACEHOLDERS: 1.0 everywhere == the original unweighted sum. Keep this run at
+# 1.0 so the measurement is unweighted
 loss_weights:
   triplet: 1.0
   themes: 1.0
   tone: 1.0
   bias: 1.0
   mlm: 1.0
+theme_loss:
+  use_pos_weight: false
+  max_pos_weight: 10.0
 gradient_diagnostics:
   enabled: true
   microbatches_per_virtual_batch: 8
-  num_virtual_batches: 5
+  num_virtual_batches: 12
   parameter_scope: final_encoder_layer
+  target_global_batch_size: 256
   diagnostic_only: true
-  run_label: scope-final_bs4_k8
   records_path: ./grad_diagnostics/sweep_records.tsv

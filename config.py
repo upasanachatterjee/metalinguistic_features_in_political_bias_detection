@@ -1,3 +1,5 @@
+import json
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 import yaml
@@ -63,6 +65,72 @@ class LossWeights:
 
 
 @dataclass
+class ThemeLossConfig:
+    """Positive-class weighting *inside* the theme task.
+
+    Distinct from `loss_weights.themes`, which scales the whole theme objective
+    against MLM/tone/triplet. `pos_weight` only rebalances positives against
+    negatives within the theme BCE; it is not a knob for inflating the theme
+    gradient norm.
+
+    Off by default. When on, weights are derived from the training split only
+    (`corpus_stats.py`'s theme_label_stats.json).
+    """
+
+    use_pos_weight: bool = False
+    max_pos_weight: float = 10.0
+    # Path to corpus_stats.py's theme_label_stats.json. Required when
+    # use_pos_weight is true.
+    stats_path: Optional[str] = None
+
+    def as_dict(self) -> dict:
+        return {
+            "use_pos_weight": self.use_pos_weight,
+            "max_pos_weight": self.max_pos_weight,
+            "stats_path": self.stats_path,
+        }
+
+    def pos_weight(self, num_themes: int) -> Optional[List[float]]:
+        """Per-theme pos_weight from the audited training counts, or None.
+
+        `raw = negatives / max(positives, 1)`, clamped into
+        `[1.0, max_pos_weight]`. Clamping at 1.0 keeps a common theme from being
+        *down*-weighted, and at `max_pos_weight` keeps a theme with a handful of
+        positives from dominating the loss.
+        """
+        if not self.use_pos_weight:
+            return None
+        if not self.stats_path:
+            raise ValueError(
+                "theme_loss.use_pos_weight is true but no stats_path was given. "
+                "Run corpus_stats.py first and point stats_path at its "
+                "theme_label_stats.json."
+            )
+        if not os.path.exists(self.stats_path):
+            raise FileNotFoundError(
+                f"theme_loss.stats_path '{self.stats_path}' does not exist. "
+                "Run corpus_stats.py to produce it."
+            )
+        with open(self.stats_path) as handle:
+            stats = json.load(handle)
+
+        per_label = stats["per_label"]
+        if len(per_label) != num_themes:
+            raise ValueError(
+                f"theme stats cover {len(per_label)} themes but the theme head has "
+                f"{num_themes}. Re-run corpus_stats.py against the same "
+                "themes_path/theme_count as this run."
+            )
+
+        weights: List[float] = []
+        for entry in sorted(per_label, key=lambda row: row["index"]):
+            positives = max(int(entry["positive_count"]), 1)
+            raw = float(entry["negative_count"]) / positives
+            weights.append(min(max(raw, 1.0), float(self.max_pos_weight)))
+        return weights
+
+
+@dataclass
 class RunConfig:
     """Schema of a run_configs/*.yaml file — one file per pretraining run."""
 
@@ -80,6 +148,9 @@ class RunConfig:
         )
     )
     loss_weights: LossWeights = field(default_factory=LossWeights)
+    # Both default to "off", so a config that omits them trains exactly as it
+    # did before these blocks existed.
+    theme_loss: ThemeLossConfig = field(default_factory=ThemeLossConfig)
     # Multi-task gradient diagnostic; disabled by default so normal training
     # behaviour is unchanged.
     gradient_diagnostics: GradientDiagnosticsConfig = field(
@@ -94,10 +165,12 @@ def load_run_config(path: str) -> RunConfig:
     task_spec = TaskSpec(**raw.pop("task_spec", {}))
     grad_diag = GradientDiagnosticsConfig(**(raw.pop("gradient_diagnostics", {}) or {}))
     loss_weights = LossWeights(**(raw.pop("loss_weights", {}) or {}))
+    theme_loss = ThemeLossConfig(**(raw.pop("theme_loss", {}) or {}))
     return RunConfig(
         train_args=train_args,
         task_spec=task_spec,
         loss_weights=loss_weights,
+        theme_loss=theme_loss,
         gradient_diagnostics=grad_diag,
         **raw,
     )

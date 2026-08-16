@@ -5,3 +5,4 @@ __pycache__/
 finetuning-results/*
 *.md
 !README.md
+cache/
