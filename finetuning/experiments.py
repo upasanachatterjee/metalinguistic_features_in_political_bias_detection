@@ -40,13 +40,11 @@ class DatasetConfig:
 
 ALLSIDES_BASE_MEDIA_SPLIT = "upasanachatterjee/AllSides-media-split"
 ALLSIDES_BASE_RANDOM_SPLIT = "upasanachatterjee/AllSides-random-split"
-_BATCH_SIZE = 128
-_GRAD_ACCUMULATION = 64
+_BATCH_SIZE = 32
+_GRAD_ACCUMULATION = 4
 _NUM_WORKERS = 8
-_EVAL_BATCH_SIZE = 128
-# Articles are truncated, not chunked, so this is the whole input a model sees.
+_EVAL_BATCH_SIZE = 32
 _MAX_LENGTH = 512
-# Tokenization/undersampling workers for datasets.map; tuned for the training box.
 _NUM_PROC = 24
 
 
