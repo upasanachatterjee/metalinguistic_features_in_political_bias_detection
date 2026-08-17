@@ -11,6 +11,7 @@ from .metrics import (
     compute_metrics,
     batched_predict_metrics_trainer,
     CustomTrainer,
+    WholeEpochCounter,
 )
 from model import MultiTaskRoberta
 
@@ -184,20 +185,10 @@ def make_training_args(
         adam_beta2=0.999,
         warmup_ratio=0.06,
         save_safetensors=False,
-        disable_tqdm=True,
+        disable_tqdm=False,
         seed=seed,
         remove_unused_columns=False,
     )
-
-
-def optimizer_steps_per_epoch(training_args: TrainingArguments, train_rows: int) -> int:
-    """Optimizer steps one epoch completes, i.e. the unit `logging_strategy='epoch'`
-    logs in.
-    """
-    world_size = max(1, training_args.world_size)
-    batches = train_rows // (training_args.per_device_train_batch_size * world_size)
-    return batches // training_args.gradient_accumulation_steps
-
 
 
 def count_unique_ids(dataset) -> int:
@@ -242,7 +233,10 @@ def make_trainer(
     print("patience=", patience)
     print("compute_fn=", compute_fn)
 
-    callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
+    callbacks = [
+        EarlyStoppingCallback(early_stopping_patience=patience),
+        WholeEpochCounter(),
+    ]
 
     return CustomTrainer(
         model=model,

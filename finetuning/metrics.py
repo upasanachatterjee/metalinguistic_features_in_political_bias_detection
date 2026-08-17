@@ -7,8 +7,9 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
 )
 from typing import Dict, Any, List
-from transformers import Trainer
+from transformers import Trainer, TrainerCallback
 from datasets import Dataset
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -61,6 +62,15 @@ class CustomTrainer(Trainer):
         if prediction_loss_only:
             return (loss, None, None)
         return (loss, logits, labels)
+
+
+class WholeEpochCounter(TrainerCallback):
+    """Round `state.epoch` up at the epoch boundary, so each epoch gets its own row in
+    the metrics table and its own `log_history` entry.
+    """
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        state.epoch = math.ceil(state.epoch)
 
 
 BIAS_CLASSES = (0, 1, 2)
