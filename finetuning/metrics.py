@@ -83,9 +83,13 @@ def _compute_classification_metrics(
 
     per_label_accuracy: Dict[str, float] = {}
     per_label_f1: Dict[str, float] = {}
+    per_label_precision: Dict[str, float] = {}
+    per_label_recall: Dict[str, float] = {}
     classes = np.unique(labels)
-    _, _, per_class_f1, _ = precision_recall_fscore_support(
-        labels, predictions, labels=classes, zero_division=0
+    per_class_precision, per_class_recall, per_class_f1, _ = (
+        precision_recall_fscore_support(
+            labels, predictions, labels=classes, zero_division=0
+        )
     )
     for idx, class_id in enumerate(classes):
         class_indices = np.where(labels == class_id)[0]
@@ -97,6 +101,8 @@ def _compute_classification_metrics(
             class_labels, class_preds
         )
         per_label_f1[f"f1_class_{class_id}"] = per_class_f1[idx]
+        per_label_precision[f"precision_class_{class_id}"] = per_class_precision[idx]
+        per_label_recall[f"recall_class_{class_id}"] = per_class_recall[idx]
 
     return {
         # "accuracy": round(float(total_accuracy) * 100, 2),
@@ -109,6 +115,8 @@ def _compute_classification_metrics(
         # "recall_micro": round(float(recall_micro) * 100, 2),
         # **{k: round(float(v) * 100, 2) for k, v in per_label_accuracy.items()},
         **{k: round(float(v) * 100, 2) for k, v in per_label_f1.items()},
+        **{k: round(float(v) * 100, 2) for k, v in per_label_precision.items()},
+        **{k: round(float(v) * 100, 2) for k, v in per_label_recall.items()},
     }
 
 

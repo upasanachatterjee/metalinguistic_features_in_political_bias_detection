@@ -86,6 +86,8 @@ def clean_dataset_optimized(
         balanced = dataset
     else:
         balanced = undersample_per_topic(dataset)
+        print("Final label distribution (after undersampling):", Counter(dataset["bias"]))
+        
 
     prepared = balanced
     prepared = prepared.flatten()
