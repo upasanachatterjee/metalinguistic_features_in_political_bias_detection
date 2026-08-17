@@ -154,7 +154,7 @@ def run_experiment(
 def make_training_args(
     output_dir: str = "test_trainer",
     num_epochs: int = 15,
-    learning_rate: float = 5e-5,
+    learning_rate: float = 1e-5,
     batch_size_override: Optional[int] = None,
     seed: int = 42,
 ) -> TrainingArguments:
@@ -163,6 +163,7 @@ def make_training_args(
         output_dir=output_dir,
         save_strategy="epoch",
         eval_strategy="epoch",
+        logging_strategy="epoch",
         save_total_limit=3,
         num_train_epochs=num_epochs,
         learning_rate=learning_rate,
@@ -173,7 +174,7 @@ def make_training_args(
         dataloader_num_workers=_NUM_WORKERS,
         load_best_model_at_end=True,
         metric_for_best_model="eval_f1_macro",
-        weight_decay=0.001,
+        weight_decay=0.01,
         adam_beta1=0.9,
         adam_beta2=0.999,
         warmup_ratio=0.06,

@@ -6,3 +6,4 @@ finetuning-results/*
 *.md
 !README.md
 cache/
+docs/

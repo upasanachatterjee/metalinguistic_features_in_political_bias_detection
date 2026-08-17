@@ -99,15 +99,15 @@ def _compute_classification_metrics(
         per_label_f1[f"f1_class_{class_id}"] = per_class_f1[idx]
 
     return {
-        "accuracy": round(float(total_accuracy) * 100, 2),
+        # "accuracy": round(float(total_accuracy) * 100, 2),
         "f1_macro": round(float(f1_macro) * 100, 2),
-        "f1_micro": round(float(f1_micro) * 100, 2),
+        # "f1_micro": round(float(f1_micro) * 100, 2),
         "f1_weighted": round(float(f1_weighted) * 100, 2),
         "precision_macro": round(float(precision_macro) * 100, 2),
         "recall_macro": round(float(recall_macro) * 100, 2),
-        "precision_micro": round(float(precision_micro) * 100, 2),
-        "recall_micro": round(float(recall_micro) * 100, 2),
-        **{k: round(float(v) * 100, 2) for k, v in per_label_accuracy.items()},
+        # "precision_micro": round(float(precision_micro) * 100, 2),
+        # "recall_micro": round(float(recall_micro) * 100, 2),
+        # **{k: round(float(v) * 100, 2) for k, v in per_label_accuracy.items()},
         **{k: round(float(v) * 100, 2) for k, v in per_label_f1.items()},
     }
 

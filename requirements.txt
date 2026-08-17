@@ -11,6 +11,7 @@ scipy==1.17.1
 PyYAML==6.0.3
 python-dotenv==1.2.2
 pandas
+matplotlib
 
 # Dev only.
 mypy==1.11.2
