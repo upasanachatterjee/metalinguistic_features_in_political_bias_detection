@@ -1,14 +1,6 @@
-"""Multi-task pretraining entry point.
-
-Trains one shared RoBERTa backbone on up to four objectives at once (triplet,
-MLM, theme classification, tone regression). Launch with a run YAML::
-
-    accelerate launch pretraining.py --config run_configs/tlp_tone_16.yaml
-
-One shuffled dataloader feeds every objective the SAME rows, so each step shows
-the four objectives one shared random subset of the corpus. One step still
-forwards the backbone six times (triplet a/p/n + themes + tone + mlm), i.e.
-~6 x batch_size sequences.
+"""Multi-task pretraining entry point: one shared RoBERTa backbone, up to four
+objectives (triplet, MLM, themes, tone). Run it as
+`accelerate launch pretraining.py --config run_configs/tlp_tone_16.yaml`.
 """
 
 import argparse
@@ -55,8 +47,7 @@ TASK_WEIGHTED_LOSS_KEYS = {
     task: key.replace("_loss", "_weighted_loss") for task, key in TASK_LOSS_KEYS.items()
 }
 
-# Collator output key -> the prefixed key MultiTaskRoberta.forward dispatches on.
-# This mapping IS the contract between collators/ and model.py.
+# Collator key -> prefixed key: this mapping IS the collators/model.py contract.
 TASK_BATCH_KEYS = {
     "triplet": {
         "a_ids": "triplet_a_ids",
@@ -103,8 +94,7 @@ class PreparedRun:
     optimizer: torch.optim.Optimizer
     scheduler: Any
     dataloader: Any
-    # Tasks the shared collator actually emits sub-batches for; a task in
-    # cfg.tasks can be missing here (themes, with no label space configured).
+    # A task in cfg.tasks can be missing here (themes, with no label space).
     active_tasks: List[str]
     max_steps_per_epoch: int
     total_steps: int
@@ -127,15 +117,11 @@ class TrainingState:
     )
 
 
-# ------------------------------------------------------------------
-# setup
-# ------------------------------------------------------------------
 def build_accelerator(
     output_dir: str, gradient_accumulation_steps: int = 1
 ) -> Accelerator:
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    # Long timeout so rank-0-only setup (filter-index build, dataset download)
-    # doesn't trip the default 10-min NCCL barrier on cold caches.
+    # Long timeout so rank-0-only setup doesn't trip the 10-min NCCL barrier.
     pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
     return Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -157,12 +143,10 @@ def checkpoint_epoch_offset(init_from_checkpoint: Optional[str]) -> int:
 
 
 def setup_model(cfg: RunConfig) -> Tuple[MultiTaskRoberta, Dict[str, Any]]:
-    """Build the model, restoring weights from `cfg.init_from_checkpoint` if set.
-
-    Head sizes come from the checkpoint when there is one -- config defaults
-    would otherwise fail `load_state_dict` on a shape mismatch. Returns the
-    model and the head sizes it was built with.
+    """Build the model, restoring from `cfg.init_from_checkpoint` if set, and return it
+    with the head sizes it was built with.
     """
+    # Head sizes come from the checkpoint, or `load_state_dict` fails on a shape.
     head_sizes: Dict[str, Any] = {
         "num_themes": cfg.theme_count,
         "num_tones": 1,
@@ -193,12 +177,8 @@ def setup_model(cfg: RunConfig) -> Tuple[MultiTaskRoberta, Dict[str, Any]]:
             f"({len(missing)} missing / {len(unexpected)} unexpected keys)"
         )
 
-    # Gradient checkpointing is currently OFF. Re-enable by uncommenting: it
-    # trades ~20-30% step time for ~5-10x lower activation memory, which is what
-    # makes batch_size=32 fit with the triplet task active. Must stay
-    # non-reentrant (see model.gradient_checkpointing_enable) -- reentrant
-    # checkpointing trips DDP's "marked ready twice" assertion when the shared
-    # backbone is forwarded multiple times per step.
+    # Gradient checkpointing is OFF; uncomment for ~5-10x less activation memory at
+    # ~20-30% more step time. Stays non-reentrant -- see gradient_checkpointing_enable.
     # model.backbone.config.use_cache = False
     # model.gradient_checkpointing_enable()
 
@@ -224,15 +204,12 @@ def prepare_run(cfg: RunConfig, accelerator: Accelerator) -> Tuple[PreparedRun, 
         tasks_to_build=cfg.tasks,
     )
 
-    # Measured before `prepare` shards the loader across ranks, because
-    # total_steps feeds the LR schedule. Everything from here on counts
-    # OPTIMIZER steps, so gradient accumulation divides in alongside the rank
-    # count
     steps_per_epoch = len(dataloader)
     max_steps_per_epoch = steps_per_epoch // (
         accelerator.num_processes * args.gradient_accumulation_steps
     )
-    args.log_every = max_steps_per_epoch // 15 if args.log_every is None else args.log_every
+    if args.log_every is None:
+        args.log_every = max(1, max_steps_per_epoch // 15)
     total_steps = args.num_epochs * max_steps_per_epoch
     if args.max_steps is not None:
         if args.max_steps > total_steps:
@@ -341,8 +318,7 @@ def build_diagnostics(
         config=cfg.gradient_diagnostics,
         output_dir=cfg.output_dir,
         train_batch_size=cfg.train_args.batch_size,
-        # The tasks the collator actually emits, so a virtual batch where a task
-        # produced nothing still records its (zero) gradient.
+        # Collator tasks, so a task that produced nothing still records a zero gradient.
         active_tasks=run.active_tasks,
         checkpoint=cfg.init_from_checkpoint or "none",
         seed=SEED,
@@ -361,9 +337,6 @@ def build_diagnostics(
     )
 
 
-# ------------------------------------------------------------------
-# batching
-# ------------------------------------------------------------------
 def next_batch(iterator: Any, dataloader: Any) -> Tuple[Dict[str, Any], Any]:
     """Next shared batch, restarting the loader if it ran out mid-epoch.
 
@@ -380,14 +353,10 @@ def next_batch(iterator: Any, dataloader: Any) -> Tuple[Dict[str, Any], Any]:
 def build_combined_batch(
     tasks: Sequence[str], batches: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Merge one shared batch's per-task sub-batches into a model kwargs dict.
-
-    `batches` is what MultiTaskCollator emitted for ONE draw of rows, so every
-    task here is looking at the same articles. Collator keys are renamed to the
-    prefixed keys MultiTaskRoberta.forward dispatches on (see TASK_BATCH_KEYS).
-    Tasks whose collator signalled `_skip` (no valid triplets in the batch, no
-    parseable tone) are already absent and contribute nothing.
+    """Merge one shared batch's per-task sub-batches into a model kwargs dict, renaming
+    collator keys to the prefixed ones `forward` dispatches on.
     """
+    # Every task here sees the same articles; tasks that signalled `_skip` are absent.
     combined: Dict[str, Any] = {}
     for task_name in tasks:
         batch = batches.get(task_name)
@@ -398,9 +367,6 @@ def build_combined_batch(
     return combined
 
 
-# ------------------------------------------------------------------
-# training
-# ------------------------------------------------------------------
 def train_one_epoch(
     epoch: int,
     cfg: RunConfig,
@@ -409,11 +375,8 @@ def train_one_epoch(
     logger: TrainingLogger,
     diagnostics: Optional[GradientDiagnostics],
 ) -> None:
-    """Run one epoch, mutating `state`.
-
-    `epoch` is 1-based, for display only. The iterator is rebuilt here, so every
-    epoch reshuffles the corpus -- once, for all four objectives at the same time.
-    """
+    """Run one epoch, mutating `state`; `epoch` is 1-based and for display only."""
+    # The iterator is rebuilt here, so each epoch reshuffles once for all objectives.
     args = cfg.train_args
     accelerator = run.accelerator
     diagnostic_only = (
@@ -448,20 +411,14 @@ def train_one_epoch(
             outputs = run.model(**combined_batch)
             total_loss = outputs.get("loss")
 
-            # Optional diagnostic: per-task gradients on the shared
-            # representation. Runs after the forward pass and BEFORE the normal
-            # backward; uses torch.autograd.grad(retain_graph=True), so it never
-            # writes to .grad and leaves the graph intact for the real backward.
+            # Runs after forward, before backward; autograd.grad leaves .grad and the graph alone.
             if diagnostics is not None and diagnostics.should_measure(state.step):
-                # The step is stamped on every measurement, so a periodic run's
-                # snapshots carry the x-axis of the trend.
+                # The step is stamped on every measurement, giving a periodic run its x-axis.
                 diagnostics.set_train_step(state.step)
                 diagnostics.record_microbatch(outputs, combined_batch)
 
                 if diagnostic_only:
-                    # No backward, no optimizer/scheduler step: every virtual
-                    # batch measures the same model state. Drop the graph before
-                    # the next forward pass so memory doesn't stack up.
+                    # No backward or step: every virtual batch measures the same model state.
                     del outputs, total_loss, combined_batch
                     state.step += 1
                     state.micro_step += 1
@@ -471,8 +428,7 @@ def train_one_epoch(
                     continue
 
                 if diagnostics.is_complete() and not diagnostics_reported:
-                    # Diagnostics ran alongside real training; report once and
-                    # let training carry on untouched.
+                    # Diagnostics ran alongside training; report once and carry on.
                     diagnostics.report()
                     diagnostics_reported = True
 
@@ -548,9 +504,6 @@ def main() -> None:
     cli = parser.parse_args()
     cfg = load_run_config(cli.config)
 
-    if not cfg.tasks:
-        raise SystemExit("No tasks configured for training (cfg.tasks is empty).")
-
     os.makedirs(cfg.output_dir, exist_ok=True)
     set_seed(SEED)
 
@@ -558,8 +511,7 @@ def main() -> None:
         cfg.output_dir, cfg.train_args.gradient_accumulation_steps
     )
 
-    # Fail fast, before the dataset is loaded: the diagnostic's per-task
-    # torch.autograd.grad calls must not run on a DDP-wrapped model.
+    # Fail fast: the diagnostic's autograd.grad must not run on a DDP-wrapped model.
     diag_cfg = cfg.gradient_diagnostics
     if diag_cfg.enabled and accelerator.num_processes != 1:
         raise RuntimeError(
@@ -577,8 +529,7 @@ def main() -> None:
         log(line)
     log("=" * 78)
 
-    # A diagnostic-only run does no training, so leave any earlier run's logs
-    # alone; the diagnostic writes its own files.
+    # A diagnostic-only run leaves earlier logs alone and writes its own files.
     logger = TrainingLogger(
         cfg.output_dir,
         TASKS,

@@ -38,16 +38,8 @@ def _login_once(state: PartialState) -> None:
 
 
 class MemoryEfficientDataset(TorchDataset):
-    """Memory-mapped view of the corpus, tokenized lazily in __getitem__.
-
-    Rows are deduplicated by title (first occurrence wins; untitled rows are
-    dropped) and, when `require_nonempty_themes_and_tone`, restricted to rows
-    that have both GDELT fields populated. Row selection is computed once as
-    index arrays cached under `cache_dir` and mmap'd by every rank.
-
-    Each item carries the tokenized text plus the raw `political_bias`,
-    `V2Themes` and `V2Tone` values; turning those into task labels is the
-    collators' job, so all four tasks share one instance of this dataset.
+    """Memory-mapped view of the corpus, tokenized lazily in `__getitem__`, carrying
+    raw `political_bias` / `V2Themes` / `V2Tone` for the collators to turn into labels.
     """
 
     def __init__(
@@ -94,13 +86,8 @@ class MemoryEfficientDataset(TorchDataset):
         cache_dir: Optional[str],
         state: PartialState,
     ) -> Dataset:
-        """Memory-map the corpus, letting rank 0 warm the HF cache first.
-
-        All ranks racing into load_dataset hammers the same cache_dir and its
-        filelock; if any rank crashes mid-load it leaves an orphan .lock that
-        deadlocks the next launch. main_process_first() lets rank 0 warm (or
-        repair) the cache alone, then the other ranks read it warm.
-        """
+        """Memory-map the corpus, letting rank 0 warm the HF cache first."""
+        # A rank crashing mid-load leaves an orphan .lock that deadlocks the next launch.
         if state.is_main_process:
             print(f"   loading {dataset_name} (memory-mapped)", flush=True)
         t = time.perf_counter()
@@ -116,8 +103,6 @@ class MemoryEfficientDataset(TorchDataset):
         if state.is_main_process:
             print(f"   loaded in {time.perf_counter() - t:.1f}s", flush=True)
 
-        if not isinstance(dataset, Dataset):
-            raise ValueError(f"Expected Dataset, got {type(dataset)}")
         return dataset
 
     def _apply_selection(
@@ -129,15 +114,10 @@ class MemoryEfficientDataset(TorchDataset):
         Arrow rewrite -- the expensive part -- is paid exactly once.
         """
         t = time.perf_counter()
-        # `select` writes a per-rank indices-mapping arrow file into the HF
-        # cache_dir; stagger it through main_process_first so rank 0 writes
-        # first and the other ranks pick up the warm cache instead of all
-        # 8 racing to write the same hashed path.
+        # Staggered so rank 0 writes the indices-mapping file and the rest read it warm.
         with state.main_process_first():
             self.dataset = self.dataset.select(keep_indices)
-        # Materialize the selection into the underlying arrow table so that
-        # `self.dataset.data.column(...)` reflects the selected view, and so
-        # __getitem__ doesn't pay the indices-mapping indirection per row.
+        # Materialized so `.data.column(...)` sees the selection and __getitem__ skips it.
         with state.main_process_first():
             self.dataset = self.dataset.flatten_indices()
         if state.is_main_process:
@@ -151,17 +131,8 @@ class MemoryEfficientDataset(TorchDataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        """Tokenize one row on demand.
-
-        Deliberately padded to the full 512 rather than dynamically per batch:
-        every step then costs the same regardless of article length, which keeps
-        the 8 DDP ranks in lockstep and makes the step-time ETA meaningful. It
-        also means the collators' own padding is a no-op. Switching to
-        `padding=False` here (and dropping the fixed `max_length` in
-        `_triplet_utils.pack_triplets`) would buy throughput on short articles,
-        at the cost of variable step times -- worth doing as its own change,
-        not silently.
-        """
+        """Tokenize one row on demand, padded to a fixed 512."""
+        # Fixed padding keeps the 8 DDP ranks in lockstep and the collators' padding a no-op.
         sample = self.dataset[idx]
         text = sample.get(self.text_col, "")
 
@@ -183,15 +154,8 @@ def build_dataloader(
     args: TrainArgs,
     tasks_to_build: Optional[Iterable[str]] = None,
 ) -> Tuple[DataLoader, List[str]]:
-    """One shuffled dataloader feeding every objective the same rows.
-
-    A single `MultiTaskCollator` runs each active task's collator over the same
-    batch of rows, so one training step shows all four objectives one shared
-    random subset of the corpus.
-
-    Pass `tasks_to_build` ("mlm", "tone", "triplet", "themes") to skip the
-    objectives the current run doesn't need. Returns the loader and the tasks it
-    actually collates.
+    """One shuffled dataloader feeding every objective the same rows, returning it
+    and the tasks it actually collates.
     """
     requested = set(tasks_to_build) if tasks_to_build is not None else set(TASK_ORDER)
 

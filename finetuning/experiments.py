@@ -25,14 +25,12 @@ from typing import Optional
 from dataclasses import dataclass
 
 
-SEED = 42
-
-
 @dataclass
 class ExperimentConfig:
     patience: int = 5
     num_epochs: int = 15
     save_model: bool = False
+    seed: int = 42
 
 
 @dataclass
@@ -40,8 +38,8 @@ class DatasetConfig:
     custom_dataset: Optional[str] = None
 
 
-ALLSIDES_EXTENDED_MEDIA_SPLIT = "upasanachatterjee/article-bias-prediction-media-splits-updated"
-ALLSIDES_EXTENDED_RANDOM_SPLIT = "upasanachatterjee/allsides_random_split_extended"
+ALLSIDES_BASE_MEDIA_SPLIT = "upasanachatterjee/AllSides-media-split"
+ALLSIDES_BASE_RANDOM_SPLIT = "upasanachatterjee/AllSides-random-split"
 _BATCH_SIZE = 128
 _GRAD_ACCUMULATION = 64
 _NUM_WORKERS = 8
@@ -50,15 +48,6 @@ _EVAL_BATCH_SIZE = 128
 _MAX_LENGTH = 512
 # Tokenization/undersampling workers for datasets.map; tuned for the training box.
 _NUM_PROC = 24
-
-
-def remove_int_bias_1(example):
-    return example["int_bias"] != 1
-
-
-def make_binary(example):
-    example["int_bias"] = 0 if example["int_bias"] in [0, 2] else 1
-    return example
 
 
 def cleanup():
@@ -70,12 +59,8 @@ def cleanup():
 
 
 def get_cleaned_dataset(dataset, tokenizer, model):
-    """Clean and tokenize all three splits.
-
-    Only the training split is undersampled -- balancing test or validation
-    would change what the reported numbers mean. Column names follow
-    MultiTaskRoberta's `bias_*` convention when that is the model being trained.
-    """
+    """Clean and tokenize all three splits, undersampling only the training one."""
+    # Balancing test or validation would change what the reported numbers mean.
     use_bias_keys = isinstance(model, MultiTaskRoberta)
 
     def prepare(split: str, skip_undersampling: bool):
@@ -100,20 +85,6 @@ def make_experiment_name(model_name: str) -> str:
     the names line up with results produced before theme-conditioned and
     whole-article variants were dropped."""
     return f"{model_name}_baseline_trunc"
-
-
-def load_and_rename_dataset() -> DatasetDict:
-    """Default AllSides split, with columns renamed to the names used here
-    ('bias'→'int_bias', 'content'→'text', 'ID'→'id')."""
-    path = "upasanachatterjee/allsides_media-splits_sentiments"
-    print("loading allsides_media-splits_sentiments")
-    ds: DatasetDict = load_dataset(path)
-    ds = (
-        ds.rename_column("bias", "int_bias")
-        .rename_column("content", "text")
-        .rename_column("ID", "id")
-    )
-    return ds
 
 
 def run_single(
@@ -146,33 +117,11 @@ def run_single(
 
 
 def _load_dataset_by_config(dataset_config: DatasetConfig) -> DatasetDict:
-    """Resolve `custom_dataset` to a DatasetDict with int_bias/text/id columns.
-
-    The value is overloaded: it names either a label transform of the default
-    AllSides split ("make_binary", "remove_int_bias_1") or a hub dataset to load
-    instead. Splits that ship without a validation set reuse test, which is only
-    used for early stopping.
-    """
-    if dataset_config.custom_dataset == "make_binary":
-        ds = load_and_rename_dataset()
-        for split in ["validation", "train", "test"]:
-            ds[split] = ds[split].map(make_binary)
-    elif dataset_config.custom_dataset == "remove_int_bias_1":
-        ds = load_and_rename_dataset()
-        for split in ["validation", "train", "test"]:
-            ds[split] = ds[split].filter(remove_int_bias_1)
-    elif dataset_config.custom_dataset == "mediabiasgroup/BABE":
-        ds = load_dataset(dataset_config.custom_dataset)
-        ds = ds.rename_column("label", "int_bias").rename_column("uuid", "id")
+    """Load one of the two AllSides splits, which already carry int_bias/text/id."""
+    # Neither ships a validation split; test stands in, and only drives early stopping.
+    ds = load_dataset(dataset_config.custom_dataset or ALLSIDES_BASE_MEDIA_SPLIT)
+    if not ds.get("validation"):
         ds["validation"] = ds["test"]
-    elif dataset_config.custom_dataset and "upasanachatterjee" in dataset_config.custom_dataset:
-        ds = load_dataset(dataset_config.custom_dataset)
-        if not ds.get("validation"):
-            ds["validation"] = ds["test"]
-    else:
-        if dataset_config.custom_dataset:
-            print("unsupported action")
-        ds = load_and_rename_dataset()
     return ds
 
 
@@ -181,19 +130,19 @@ def run_experiment(
     loc: str,
     dataset_config: Optional[DatasetConfig] = None,
     experiment_config: Optional[ExperimentConfig] = None,
+    model_name: Optional[str] = None,
 ) -> dict:
-    """Fine-tune one model on one bias dataset and write its test metrics.
-
-    `model` is a hub name or checkpoint path (see `models.load_model`); `loc` is
-    the directory the metrics JSON lands in. Returns those metrics.
+    """Fine-tune one hub name or checkpoint path on one bias dataset, writing its test
+    metrics into `loc` and returning them.
     """
+    # `model_name` names the file: every non-hub path would otherwise be "custom".
     if dataset_config is None:
         dataset_config = DatasetConfig()
     if experiment_config is None:
         experiment_config = ExperimentConfig()
 
-    set_seed(SEED)
-    model_name = get_model_name(model)
+    set_seed(experiment_config.seed)
+    model_name = model_name or get_model_name(model)
     cleanup()
 
     if dataset_config.custom_dataset:
@@ -209,6 +158,7 @@ def make_training_args(
     num_epochs: int = 15,
     learning_rate: float = 5e-5,
     batch_size_override: Optional[int] = None,
+    seed: int = 42,
 ) -> TrainingArguments:
     """Shared HF TrainingArguments for every finetuning run in this study."""
     return TrainingArguments(
@@ -230,18 +180,9 @@ def make_training_args(
         adam_beta2=0.999,
         warmup_ratio=0.06,
         save_safetensors=False,
-        seed=SEED,
+        seed=seed,
         remove_unused_columns=False,
     )
-
-
-def ensure_validation_dataset(test_ds, val_ds):
-    if val_ds and len(val_ds) > 0:
-        return val_ds
-    if test_ds and len(test_ds) > 0:
-        print("No validation set, using test as validation")
-        return test_ds
-    raise ValueError("Both validation and test sets are empty")
 
 
 def count_unique_ids(dataset) -> int:
@@ -269,6 +210,8 @@ def training_args_to_dict(training_args: TrainingArguments, patience: int) -> di
             "weight_decay",
             "warmup_ratio",
             "fp16",
+            # Recorded so a metrics JSON identifies its own seed, not just its directory.
+            "seed",
         ]
     } | {"patience": patience}
 
@@ -313,15 +256,11 @@ def train_model(
     save_name: str,
     experiment_config: ExperimentConfig,
 ) -> dict:
-    """Fine-tune on the training split, early-stopping on validation, score on test.
-
-    Returns the test metrics, with the training arguments attached for the
-    record. Validation is only used for model selection, so no metrics from it
-    are reported.
+    """Fine-tune on train, early-stop on validation, score on test. Returns the test
+    metrics with the training arguments attached; validation only selects the model.
     """
-    training_args = make_training_args(num_epochs=experiment_config.num_epochs)
+    training_args = make_training_args(num_epochs=experiment_config.num_epochs, seed=experiment_config.seed)
     print("per_device_train_batch_size=", training_args.per_device_train_batch_size)
-    val_ds = ensure_validation_dataset(test_ds, val_ds)
 
     trainer = make_trainer(
         model,

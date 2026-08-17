@@ -55,7 +55,7 @@ train_args:
   num_epochs: 1
   batch_size: 32                # per GPU
   warmup_ratio: 0.06
-  log_every: 500                # steps between progress lines
+  log_every: 500                # steps between progress lines; omit for ~15 per epoch
 task_spec:
   dataset_name: upasanachatterjee/bignewsalign-with-gdelt
   themes_path: top_themes.txt
@@ -94,14 +94,15 @@ of the AllSides data:
 
 ```python
 media_results = run_all_models(
-    dataset=ALLSIDES_EXTENDED_MEDIA_SPLIT,
+    dataset=ALLSIDES_BASE_MEDIA_SPLIT,
     output_prefix="results_undersampling/media_split",
 )
 ```
 
 Each model writes a `<name>_baseline_trunc_test_metrics.json` into
 `output_prefix`, containing accuracy, macro/micro F1, precision and recall, the
-per-class breakdown, the raw predictions, and the training arguments used.
+per-class breakdown, the raw per-example predictions, labels and ids, and the
+training arguments used.
 
 To evaluate a checkpoint you trained yourself, pass its path instead of a hub name:
 
@@ -109,8 +110,9 @@ To evaluate a checkpoint you trained yourself, pass its path instead of a hub na
 run_experiment(
     model="./my_run/epoch-1.pt",
     loc="results/my_run",
-    dataset_config=DatasetConfig(custom_dataset=ALLSIDES_EXTENDED_MEDIA_SPLIT),
-    experiment_config=ExperimentConfig(patience=3, num_epochs=15),
+    dataset_config=DatasetConfig(custom_dataset=ALLSIDES_BASE_MEDIA_SPLIT),
+    experiment_config=ExperimentConfig(patience=3, num_epochs=15, seed=42),
+    model_name="my_run",
 )
 ```
 

@@ -1,23 +1,5 @@
-"""Per-run training logs.
-
-Two files, both written into the run's ``output_dir``:
-
-``training_log.txt``  human-readable -- the run summary, then one block per
-                      logging interval (progress line + task losses).
-``losses.tsv``        tidy per-interval losses, the file to plot from. One row
-                      per logging interval, two columns per task::
-
-                          import pandas as pd
-                          df = pd.read_csv("losses.tsv", sep="\\t")
-                          df.plot(x="step", y=["triplet", "mlm", "tone", "themes"])
-
-The ``<task>`` columns are the RAW, unweighted per-task losses (see
-``MultiTaskRoberta.forward``), so they stay comparable across loss weightings.
-The ``<task>_weighted`` columns are those same losses times their
-``loss_weights`` entry -- the contribution each objective actually made to the
-total the optimizer stepped on. Under the default all-1.0 weighting the two are
-identical; when they are not, the raw column says what the objective is doing
-and the weighted column says how much of it the optimizer heard.
+"""Writes `training_log.txt` and `losses.tsv` into the run's `output_dir`, one row per
+logging interval with a raw `<task>` and a `<task>_weighted` column per objective.
 """
 
 import os
@@ -93,8 +75,7 @@ class TrainingLogger:
             f"{task}={value:.4f}" for task, value in task_losses.items()
         )
         block = [header, losses]
-        # Only worth a second line when a weight is actually doing something;
-        # under the default all-1.0 weighting it would repeat the line above.
+        # Only when a weight is doing something; all-1.0 would repeat the line above.
         if any(
             abs(weighted_losses.get(task, value) - value) > 1e-9
             for task, value in task_losses.items()
@@ -121,8 +102,7 @@ class TrainingLogger:
             f"{progress.elapsed_seconds:.1f}",
             f"{progress.steps_per_second:.3f}",
         ]
-        # A task with no loss this interval leaves its cell empty rather than 0,
-        # so pandas reads it as NaN and the curve breaks instead of dipping.
+        # An empty cell reads as NaN, so the curve breaks instead of dipping to 0.
         for source in (task_losses, weighted_losses):
             for task in self.tasks:
                 value: Optional[float] = source.get(task)

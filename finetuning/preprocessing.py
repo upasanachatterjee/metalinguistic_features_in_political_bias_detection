@@ -1,26 +1,19 @@
 import numpy as np
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from transformers import PreTrainedTokenizerBase
 from datasets import Dataset
-import json
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-
-
 def undersample_per_topic(dataset: Dataset) -> Dataset:
-    """Balance the `int_bias` classes within each topic by undersampling.
-
-    Balancing per topic rather than globally keeps a model from learning topic
-    as a proxy for bias. Every topic is cut to its own smallest class, and rows
-    with a null topic are dropped entirely, so the output size depends on how
-    skewed the topic distribution is -- print the length if you need it.
+    """Undersample `int_bias` to its smallest class within each topic, dropping rows
+    with a null topic.
     """
-    # Convert columns to numpy arrays once for speed
+    # Per topic rather than globally, or the model learns topic as a proxy for bias.
     topics = np.array(dataset["topic"])
     labels = np.array(dataset["int_bias"])
     all_indices = []
@@ -81,12 +74,8 @@ def clean_dataset_optimized(
     skip_undersampling=False,
     use_bias_keys: bool = True,
 ) -> Dataset | None:
-    """Balance and tokenize a bias split.
-
-    Text is truncated at `max_length`, never split, so one article is one row.
-    With `use_bias_keys` the columns are renamed to MultiTaskRoberta's `bias_*`
-    convention; otherwise to the plain `labels`/`input_ids` the HF baselines use.
-    Returns None for an empty split.
+    """Balance and tokenize a bias split, truncating at `max_length` so one article is
+    one row. `use_bias_keys` picks MultiTaskRoberta's `bias_*` names over the plain ones.
     """
     print("Initial label distribution:", Counter(dataset["int_bias"]))
 

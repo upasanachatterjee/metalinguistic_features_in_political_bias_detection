@@ -14,12 +14,8 @@ import torch.nn.functional as F
 
 
 def _unpack(inputs, outputs):
-    """Pull (labels, logits, loss) out of a batch/output pair.
-
-    MultiTaskRoberta uses `bias_*` keys so one forward can carry several tasks;
-    the HF baselines use the plain `labels`/`logits`/`loss` names. Preferring
-    the prefixed key and falling back to the plain one lets a single Trainer
-    drive either. Any of the three may come back None.
+    """Pull (labels, logits, loss) out of a batch/output pair, any of which may be
+    None. Prefers MultiTaskRoberta's `bias_*` keys, falling back to the plain names.
     """
     labels = inputs.get("bias_labels")
     if labels is None:
@@ -40,10 +36,8 @@ def _unpack(inputs, outputs):
 
 
 class CustomTrainer(Trainer):
-    """Trainer that accepts either MultiTaskRoberta or an HF baseline.
-
-    The two disagree on output key names; `_unpack` reconciles them. Nothing
-    else here differs from the stock Trainer.
+    """Trainer accepting either MultiTaskRoberta or an HF baseline, which disagree on
+    output key names; `_unpack` reconciles them and nothing else differs.
     """
 
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -73,18 +67,6 @@ def _compute_classification_metrics(
 ) -> Dict[str, Any]:
     predictions = np.asarray(predictions)
     labels = np.asarray(labels)
-
-    if predictions.ndim != 1:
-        raise ValueError(
-            f"Expected predictions shape (batch_size,), got {predictions.shape}"
-        )
-    if labels.ndim != 1:
-        raise ValueError(f"Expected labels shape (batch_size,), got {labels.shape}")
-    if predictions.shape[0] != labels.shape[0]:
-        raise ValueError(
-            "Predictions and labels must have the same number of samples, "
-            f"got {predictions.shape[0]} and {labels.shape[0]}"
-        )
 
     total_accuracy = accuracy_score(labels, predictions)
     f1_macro = f1_score(labels, predictions, average="macro")
@@ -136,30 +118,17 @@ def compute_metrics(eval_pred) -> Dict[str, Any]:
     if isinstance(logits, tuple):
         logits = logits[0]
 
-    logits = np.asarray(logits)
-    labels = np.asarray(labels)
-
-    if logits.ndim != 2:
-        raise ValueError(
-            f"Expected logits shape (batch_size, num_labels), got {logits.shape}"
-        )
-    if labels.ndim != 1:
-        raise ValueError(f"Expected labels shape (batch_size,), got {labels.shape}")
-
-    predictions = np.argmax(logits, axis=-1)
+    predictions = np.argmax(np.asarray(logits), axis=-1)
     return _compute_classification_metrics(predictions, labels)
 
 
 def batched_predict_metrics_trainer(
     trainer: Trainer, dataset: Dataset, batch_size: int = 64
 ) -> Dict[str, Any]:
-    """Predict over the dataset in slices and score the result.
-
-    Sliced only to bound peak memory -- `preprocessing.clean_dataset_optimized`
-    truncates each article to one row, so one row is one article and the metrics
-    are per-article as they stand. Returns the metric dict plus the raw preds,
-    labels and ids, for error analysis.
+    """Predict over the dataset in slices and score it, returning the metrics plus raw
+    preds, labels and ids for error analysis.
     """
+    # Sliced only to bound peak memory; one row is already one article.
     all_logits: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
     all_ids: List[Any] = []
@@ -178,11 +147,6 @@ def batched_predict_metrics_trainer(
             logits = logits[0]
 
         logits = np.asarray(logits)
-        if logits.ndim != 2:
-            raise ValueError(
-                f"Expected logits shape (batch_size, num_labels), got {logits.shape}"
-            )
-
         labels = np.asarray(output.label_ids)
         all_logits.append(logits)
         all_labels.append(labels)

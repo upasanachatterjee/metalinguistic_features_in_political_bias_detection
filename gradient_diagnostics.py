@@ -1,57 +1,7 @@
-"""Temporary diagnostic utility for multi-task gradient analysis.
+"""Temporary diagnostic: per-task gradient magnitude on the shared representation, the
+pairwise conflict between those gradients, and the triplet geometry behind one of them.
 
-Measures, for each task loss returned by ``MultiTaskRoberta``:
-
-1. the magnitude of the gradient it produces on the *shared* transformer
-   representation (by default the final RoBERTa encoder layer);
-2. the pairwise alignment / conflict between those task gradients;
-3. for triplet, the geometry behind that gradient (how many triplets were
-   mined, how many were active, how far apart the pairs sit).
-
-Batch geometry
---------------
-Normal training takes one optimizer step from 8 GPUs x 32 examples = 256. DDP
-builds each rank's task losses from its OWN local batch of 32 and then averages
-the resulting *gradients* across ranks -- it never forms a 256-example batch.
-
-The single-GPU diagnostic reproduces that by running K consecutive local batches
-of 32 and averaging their gradient vectors::
-
-    g_bar_t = (1 / K) * sum_k g_t_k          K = microbatches_per_virtual_batch
-
-Every reported number derives from ``g_bar_t``. In particular the norm is
-``||g_bar_t||`` and NOT ``(1/K) * sum_k ||g_t_k||`` -- the latter is systematically
-larger, and by a different factor per task, because it never lets opposing
-microbatch gradients cancel. Cosines likewise compare averaged vectors.
-
-A microbatch that produces no loss for a task (triplet, when the batch has no
-usable left/right split) contributes a **zero vector**, and the sum is still
-divided by K. That is what DDP does when one rank's triplet loss is empty, so
-dividing by "the number of microbatches that had triplets" would overstate the
-triplet gradient exactly when triplets are scarce.
-
-Outputs (all written to the run's ``output_dir``)
--------------------------------------------------
-``gradient_diagnostics.txt``   human-readable report (tables + interpretation)
-``gradient_diagnostics.tsv``   tidy long-format measurements, one row per
-                               (virtual batch, metric); the file for plots and
-                               paper tables. Concatenates cleanly across runs
-                               because every row carries the knob settings.
-``gradient_diagnostics.json``  the full run record: config knobs, environment,
-                               provenance (commit, seed, checkpoint), every
-                               per-virtual-batch measurement, summary statistics
-                               and suggested weights -- everything a reader needs
-                               to reproduce the numbers.
-
-Reading the TSV::
-
-    import pandas as pd, glob
-    df = pd.concat(
-        pd.read_csv(p, sep="\\t", comment="#") for p in glob.glob("*/gradient_diagnostics.tsv")
-    )
-    norms = df[df.metric == "grad_norm"]
-    norms.pivot_table(index="task_a", columns="parameter_scope", values="value",
-                      aggfunc="median")
+Norms are `||(1/K) sum_k g_k||`, never `(1/K) sum_k ||g_k||`
 """
 
 from __future__ import annotations
@@ -75,9 +25,6 @@ import torch
 EPS = 1e-12
 
 # Logical task name -> exact key returned by MultiTaskRoberta.forward().
-# Verified against model.py: the model emits "triplet_loss", "theme_loss",
-# "tone_loss", and "mlm_loss",
-# plus the summed "loss".
 TASK_LOSS_KEYS: Dict[str, str] = {
     "triplet": "triplet_loss",
     "themes": "theme_loss",
@@ -85,8 +32,7 @@ TASK_LOSS_KEYS: Dict[str, str] = {
     "mlm": "mlm_loss",
 }
 
-# Logical task name -> batch key used to count examples per microbatch, so the
-# printout can confirm each virtual batch really covers K x batch_size examples.
+# Task -> batch key counted per microbatch, to confirm K x batch_size examples.
 TASK_BATCH_KEYS: Dict[str, str] = {
     "triplet": "triplet_a_ids",  # anchors; each anchor also pulls a pos + neg
     "themes": "theme_input_ids",
@@ -94,23 +40,17 @@ TASK_BATCH_KEYS: Dict[str, str] = {
     "mlm": "mlm_input_ids",
 }
 
-# The reference task for suggested weights: w_mlm is pinned to 1.0 and every
-# other weight is expressed relative to it.
+# Reference task for suggested weights: w_mlm is pinned to 1.0, the rest relative.
 REFERENCE_TASK = "mlm"
 
-# Suggested weights are clamped into this range. A diagnostic that asks for a
-# 50x reweighting is telling you something is wrong with the task, not that the
-# weight should be 50.
+# Clamp: a suggested 50x reweighting means the task is wrong, not the weight.
 MIN_SUGGESTED_WEIGHT = 0.2
 MAX_SUGGESTED_WEIGHT = 5.0
 
-# Suggested weights are rounded DOWN onto this grid. Rounding down keeps the
-# "conservative" column from ever recommending a larger change than the maths
-# actually supports.
+# Rounded DOWN onto this grid, so "conservative" never overstates the change.
 WEIGHT_ROUNDING_GRID = 0.05
 
-# Cosine below this, repeatedly, is worth investigating. A single negative
-# measurement -- or a cluster just under zero -- is not evidence of conflict.
+# Repeated cosines below this are worth investigating; one negative is not.
 CONFLICT_COSINE = -0.3
 
 # Triplet geometry keys carried through from model._triplet_stats.
@@ -122,9 +62,7 @@ TRIPLET_STAT_KEYS = (
     "mean_violation",
 )
 
-# Columns of the tidy TSV. Every row carries the knob settings so that TSVs
-# from separate runs (different scope / batch size / K) can be concatenated and
-# grouped without a separate join.
+# Every row carries the knob settings, so TSVs from separate runs concatenate.
 TSV_COLUMNS: Tuple[str, ...] = (
     "run_id",
     "run_label",
@@ -164,31 +102,9 @@ TSV_HEADER_COMMENT = """\
 
 @dataclass
 class GradientDiagnosticsConfig:
-    """YAML-configurable knobs for the gradient diagnostic.
-
-    The diagnostic emulates one normal optimizer step, which comes from
-    ``num_gpus x batch_size`` examples. Set::
-
-        microbatches_per_virtual_batch = target_global_batch_size // batch_size
-
-    and the constructor verifies it; a mismatch raises rather than warns,
-    because every norm and cosine in the report is only meaningful relative to
-    the batch geometry it was measured at.
-
-    ``run_label`` names the run in the TSV/JSON so a knob sweep (scope, batch
-    size, K, checkpoint, ...) can be grouped and plotted. Left unset it is
-    derived as e.g. ``scope-final_bs32_k8_global256_init``.
-    ``records_path`` optionally appends every row to a shared sweep file as well
-    as the per-run TSV.
-
-    ``diagnostics_every_n_virtual_batches`` turns the one-shot measurement into a
-    periodic one: every N virtual batches of training, a *snapshot* of
-    ``num_virtual_batches`` measurements is taken and written as its own file
-    set, so a single run shows how the objectives evolve. It needs
-    ``diagnostic_only: false`` -- a frozen model has no trend to show. When
-    ``train_args.gradient_accumulation_steps`` equals
-    ``microbatches_per_virtual_batch``, one virtual batch is exactly one
-    optimizer step and N is simply "every N training steps".
+    """YAML knobs for the gradient diagnostic. Set
+    `microbatches_per_virtual_batch = target_global_batch_size // batch_size`; the
+    constructor raises on a mismatch, since every number is relative to that geometry.
     """
 
     enabled: bool = False
@@ -199,8 +115,7 @@ class GradientDiagnosticsConfig:
     diagnostics_every_n_virtual_batches: Optional[int] = None
     # Global batch size the diagnostic emulates: 8 GPUs x 32 per GPU.
     target_global_batch_size: int = 256
-    # Cap on examples retained for the tone/theme quality metrics, to bound the
-    # memory the collected logits take (themes are 2000 floats per example).
+    # Caps retained examples: theme logits are 2000 floats each.
     max_metric_examples: int = 4096
     run_label: Optional[str] = None
     records_path: Optional[str] = None
@@ -209,15 +124,8 @@ class GradientDiagnosticsConfig:
 def get_diagnostic_parameters(
     base_model: torch.nn.Module, scope: str
 ) -> Tuple[List[torch.nn.Parameter], List[str]]:
-    """Return the shared-representation parameters to differentiate against.
-
-    ``base_model`` must be the unwrapped model (``accelerator.unwrap_model``).
-    Scopes are intentionally pluggable so the analysis can be widened later:
-
-    - ``final_encoder_layer``   -- backbone.encoder.layer[-1] (~7M params)
-    - ``last_N_encoder_layers`` -- e.g. ``last_4_encoder_layers``
-    - ``full_backbone``         -- the whole RoBERTa backbone (~110M params;
-                                   ~440MB of CPU float32 per task accumulator)
+    """The shared-representation parameters to differentiate against, from an
+    unwrapped `base_model`. `full_backbone` costs ~440MB of CPU float32 per task.
     """
     # Typed as Any: nn.Module.__getattr__ returns Tensor | Module.
     backbone: Any = base_model.backbone
@@ -241,8 +149,6 @@ def get_diagnostic_parameters(
             if param.requires_grad:
                 params.append(param)
                 names.append(name)
-    if not params:
-        raise ValueError(f"No trainable parameters found for scope '{scope}'.")
     return params, names
 
 
@@ -258,10 +164,8 @@ def scope_tag(scope: str) -> str:
 
 
 def checkpoint_tag(checkpoint: Optional[str]) -> str:
-    """Short form of the checkpoint the diagnostic started from.
-
-    ``init`` means fresh roberta-base, i.e. step 0 of pretraining; otherwise the
-    checkpoint's filename stem, so ``epoch-1.pt`` becomes ``epoch-1``.
+    """Short form of the starting checkpoint: `init` for a fresh roberta-base,
+    otherwise the filename stem, so `epoch-1.pt` becomes `epoch-1`.
     """
     if not checkpoint or checkpoint == "none":
         return "init"
@@ -338,8 +242,7 @@ def describe(values: Sequence[float]) -> Dict[str, float]:
         "p95": percentile(0.95),
         "min": ordered[0],
         "max": ordered[-1],
-        # Dimensionless spread: which task's gradient is *unstable*, not just
-        # large. Undefined for a mean of zero.
+        # Dimensionless spread: which gradient is *unstable*, not merely large.
         "cv": (std / abs(mean)) if abs(mean) > EPS else float("nan"),
     }
 
@@ -448,13 +351,7 @@ class GradientDiagnostics:
         self.num_params = sum(p.numel() for p in self.parameters)
         self.applied_loss_weights = dict(getattr(base_model, "loss_weights", {}) or {})
 
-        # Tasks that must produce a measurement in EVERY virtual batch. A task
-        # that yielded no loss in any of the K microbatches still gets a
-        # zero-vector gradient (and so a norm of 0) rather than a missing row --
-        # otherwise a virtual batch where triplet mining failed throughout would
-        # silently drop out of the median. Callers should pass the run's active
-        # tasks; without them the list grows as tasks are first seen, which
-        # leaves the earliest virtual batches short a row.
+        # A task with no loss records norm 0, or it drops out of its own median.
         self.tracked_tasks: List[str] = [
             task for task in TASK_LOSS_KEYS if active_tasks and task in active_tasks
         ]
@@ -471,8 +368,7 @@ class GradientDiagnostics:
 
         self._acc = _VirtualBatchAccumulator()
 
-        # Per-snapshot measurement state; `_reset_window` clears it so each
-        # snapshot describes only its own slice of training.
+        # Per-snapshot state; `_reset_window` keeps snapshots independent.
         self.norm_history: Dict[str, List[float]] = {}
         self.cosine_history: Dict[Tuple[str, str], List[float]] = {}
         self.loss_history: Dict[str, List[float]] = {}
@@ -496,7 +392,6 @@ class GradientDiagnostics:
 
         self._emit_header(param_names)
 
-    # ------------------------------------------------------------------
     def _emit_header(self, param_names: Sequence[str]) -> None:
         config = self.config
         k = config.microbatches_per_virtual_batch
@@ -505,8 +400,7 @@ class GradientDiagnostics:
         self._emit("GRADIENT DIAGNOSTICS (temporary; training objective unchanged)")
         self._emit("=" * 78)
 
-        # Batch-geometry verification, printed before anything else: every other
-        # number in this report is conditional on it.
+        # Printed first: every other number in the report is conditional on it.
         self._emit("  diagnostic batch size:         "
                    f"{self.train_batch_size:>10}")
         self._emit(f"  microbatches per virtual batch:{k:>10}")
@@ -593,9 +487,6 @@ class GradientDiagnostics:
             )
         self._emit("-" * 78)
 
-    # ------------------------------------------------------------------
-    # collection
-    # ------------------------------------------------------------------
     @property
     def periodic(self) -> bool:
         """True when snapshots are taken during training rather than once."""
@@ -641,14 +532,10 @@ class GradientDiagnostics:
         outputs: Dict[str, torch.Tensor],
         combined_batch: Optional[Dict[str, torch.Tensor]] = None,
     ) -> None:
-        """Compute per-task gradients for one microbatch.
-
-        Must be called *after* the forward pass and *before*
-        ``accelerator.backward(total_loss)``. Uses ``retain_graph=True`` so the
-        normal combined backward can still run afterwards; the graph is released
-        when the caller drops ``outputs``, so nothing is retained between
-        microbatches.
+        """Compute per-task gradients for one microbatch, after the forward pass and
+        before `accelerator.backward`.
         """
+        # retain_graph=True so the combined backward still runs on the same graph.
         if self.is_complete():
             return
 
@@ -665,9 +552,7 @@ class GradientDiagnostics:
         for task, loss_key in TASK_LOSS_KEYS.items():
             loss = outputs.get(loss_key)
             if loss is None:
-                # No loss for this task in this microbatch -- an idle DDP rank.
-                # Nothing accumulates, and _finalize still divides by K, so the
-                # microbatch contributes a zero vector.
+                # An idle DDP rank: _finalize still divides by K, so this is a zero vector.
                 continue
             if not torch.is_tensor(loss) or not loss.requires_grad:
                 self._warn_once(
@@ -692,8 +577,7 @@ class GradientDiagnostics:
                 acc.grad_sums[task] = vector
             acc.task_microbatches[task] = acc.task_microbatches.get(task, 0) + 1
             acc.loss_sums[task] = acc.loss_sums.get(task, 0.0) + float(loss.item())
-            # The gradient vector is already detached and on CPU; drop the
-            # autograd tensors immediately so no graph outlives this iteration.
+            # Drop the autograd tensors now so no graph outlives this iteration.
             del grads, vector
 
         acc.diag_seconds += time.perf_counter() - started
@@ -717,9 +601,7 @@ class GradientDiagnostics:
             self._acc.triplet_stats.append(dict(stats))
             return
 
-        # The triplet collator signalled `_skip`, so this local batch produced no
-        # valid triplets at all. Record it as zero triplets -- its gradient
-        # contribution is the zero vector.
+        # Collator signalled `_skip`: no valid triplets at all, so record zero.
         if combined_batch is not None and "triplet_a_ids" not in combined_batch:
             self._acc.triplet_empty_microbatches += 1
             self._acc.triplet_stats.append({"num_triplets": 0})
@@ -791,8 +673,7 @@ class GradientDiagnostics:
         index = self.window_virtual_batches
         wall_seconds = time.perf_counter() - acc.started
 
-        # ||mean gradient||, NOT mean of per-microbatch norms. Always divided by
-        # K, never by the number of microbatches that happened to carry the task.
+        # ||mean gradient||, not mean of norms; always over K, not over the tasked ones.
         mean_grads: Dict[str, torch.Tensor] = {
             task: grad_sum / float(k) for task, grad_sum in acc.grad_sums.items()
         }
@@ -800,13 +681,7 @@ class GradientDiagnostics:
             if task not in self.tracked_tasks:
                 self.tracked_tasks.append(task)
 
-        # Norms for every tracked task, in a fixed order, so the series all have
-        # one entry per virtual batch. A task that produced no loss in any of
-        # the K microbatches has a mean gradient of exactly zero -- recorded as
-        # 0.0 rather than dropped, which would quietly remove the worst virtual
-        # batches from its median. The zero vector is never materialized (it can
-        # be 110M floats under full_backbone) and takes no part in the cosines,
-        # where it would be undefined.
+        # Fixed order; an absent task records 0.0 rather than skewing its own median.
         norms: Dict[str, float] = {}
         for task in self.tracked_tasks:
             mean_grad = mean_grads.get(task)
@@ -846,8 +721,7 @@ class GradientDiagnostics:
             norm_a = torch.linalg.vector_norm(g_a)
             norm_b = torch.linalg.vector_norm(g_b)
             if float(norm_a) < EPS or float(norm_b) < EPS:
-                # Cosine against a zero vector is undefined, not zero. Skipping
-                # keeps it out of the median and out of the conflict fractions.
+                # Cosine against a zero vector is undefined, not zero: skip it.
                 continue
             cosine = float((torch.dot(g_a, g_b) / (norm_a * norm_b)).item())
             self.cosine_history.setdefault((task_a, task_b), []).append(cosine)
@@ -890,9 +764,7 @@ class GradientDiagnostics:
                 int(s.get("num_triplets", 0)) for s in acc.triplet_stats
             ),
         }
-        # The distance/violation averages describe the microbatches that had
-        # triplets; averaging a distance over an empty batch is meaningless (the
-        # *gradient* still counts that batch as zero -- see _finalize).
+        # Averaged over microbatches that had triplets; the gradient still counts zero.
         for key in TRIPLET_STAT_KEYS:
             if key == "num_triplets":
                 continue
@@ -931,9 +803,6 @@ class GradientDiagnostics:
                 f"{'n/a' if active is None else f'{active:.2f}'}"
             )
 
-    # ------------------------------------------------------------------
-    # snapshots
-    # ------------------------------------------------------------------
     def emit_snapshot(self) -> Optional[Dict[str, Any]]:
         """Close the current measurement window and write its own file set.
 
@@ -974,13 +843,10 @@ class GradientDiagnostics:
         return snapshot
 
     def _reset_window(self) -> None:
-        """Clear per-window measurement state so the next snapshot stands alone.
-
-        Without this every snapshot would pool all training so far and the trend
-        would be invisible -- the medians would drift only as fast as a growing
-        sample lets them. The `_task_metrics` memo has to go too, or the cached
-        tone/theme numbers from the first window would be served forever.
+        """Clear per-window state so the next snapshot stands alone; without it every
+        snapshot pools all training so far and the trend flattens.
         """
+        # The `_task_metrics` memo goes too, or the first window's numbers persist.
         self.norm_history = {}
         self.cosine_history = {}
         self.loss_history = {}
@@ -993,18 +859,13 @@ class GradientDiagnostics:
         self._theme_labels = []
         self._task_metrics = None
 
-    # ------------------------------------------------------------------
-    # reporting
-    # ------------------------------------------------------------------
     def summary(self) -> Dict[str, Any]:
         """Summary statistics per task and per task pair (also used for JSON)."""
         norms = {task: describe(v) for task, v in self.norm_history.items()}
         cosines = {}
         for (task_a, task_b), values in self.cosine_history.items():
             stats = describe(values)
-            # Reported as plain fractions, deliberately without a verdict: a
-            # cosine of -0.05 in 6 of 12 virtual batches is near-orthogonality,
-            # not conflict.
+            # Plain fractions, no verdict: -0.05 half the time is orthogonality.
             stats["fraction_negative"] = sum(v < 0 for v in values) / len(values)
             stats["fraction_below_-0.3"] = sum(
                 v < CONFLICT_COSINE for v in values
@@ -1020,26 +881,21 @@ class GradientDiagnostics:
         }
 
     def task_metrics(self) -> Dict[str, Any]:
-        """Tone / theme quality read-outs over the collected predictions.
-
-        Imported lazily so the diagnostic still runs if scikit-learn/scipy are
-        missing; it is the gradients that matter here, the metrics are extra.
-        Computed once and cached -- both the text report and the JSON want them.
+        """Tone / theme quality read-outs over the collected predictions, computed
+        once and cached for both the text report and the JSON.
         """
+        # Imported lazily so a missing scikit-learn/scipy does not stop the gradients.
         if self._task_metrics is not None:
             return self._task_metrics
         self._task_metrics = self._compute_task_metrics()
         return self._task_metrics
 
     def _compute_task_metrics(self) -> Dict[str, Any]:
+        import numpy as np
+
+        import task_metrics as tm
+
         metrics: Dict[str, Any] = {}
-        try:
-            import numpy as np
-
-            import task_metrics as tm
-        except ImportError as error:  # pragma: no cover - optional dependency
-            return {"error": f"metrics unavailable: {error}"}
-
         if self._tone_preds:
             metrics["tone"] = tm.tone_metrics(self._tone_preds, self._tone_targets)
         if self._theme_logits:
@@ -1050,20 +906,10 @@ class GradientDiagnostics:
         return metrics
 
     def suggested_weights(self) -> Dict[str, Any]:
-        """Weights that equalize gradient magnitude against MLM.
-
-        ``w_mlm = 1`` by definition; for any other task
-
-            w_i = sqrt(g_mlm / g_i)
-
-        with ``g`` the MEDIAN virtual-batch gradient norm. The square root is
-        deliberate: a full ``g_mlm / g_i`` correction assumes the gradient norm
-        is the only thing that matters and tends to overshoot, so this moves the
-        tasks halfway (in log space) toward equal magnitude.
-
-        Informational only. Nothing here is written back into the training
-        config, and the diagnostic never changes the weights it ran under.
+        """Weights equalizing gradient magnitude against MLM: `w_i = sqrt(g_mlm / g_i)`
+        over median norms. Informational only -- nothing writes these back.
         """
+        # The sqrt is deliberate: a full g_mlm/g_i correction overshoots.
         medians = {task: statistics.median(v) for task, v in self.norm_history.items()}
         if REFERENCE_TASK not in medians:
             return {
@@ -1096,8 +942,7 @@ class GradientDiagnostics:
         }
 
     def report(self) -> None:
-        # In periodic mode any measurements still open belong to a final
-        # snapshot, so the last steps of training are represented.
+        # Open measurements become a final snapshot, so the run's end is represented.
         if self.periodic:
             self.emit_snapshot()
             self._report_trend()
@@ -1129,7 +974,6 @@ class GradientDiagnostics:
         self._emit("=" * 78)
         self._write_outputs()
 
-    # ------------------------------------------------------------------
     def _report_trend(self) -> None:
         """Per-snapshot tables: how each objective moved over training."""
         self._emit("")
@@ -1152,8 +996,7 @@ class GradientDiagnostics:
         pairs = sorted({p for s in self.snapshots for p in s["summary"]["cosine"]})
 
         def table(title: str, note: str, columns: Sequence[str], cell) -> None:
-            # Width follows the longest column name, or pair names like
-            # "themes|triplet" run into each other in the header.
+            # Width follows the longest name, or pairs like "themes|triplet" collide.
             width = max(12, max((len(c) for c in columns), default=0) + 2)
             self._emit("")
             self._emit(title)
@@ -1341,12 +1184,11 @@ class GradientDiagnostics:
 
     def _report_task_metrics(self) -> None:
         metrics = self.task_metrics()
-        if not metrics or "error" in metrics:
+        if not metrics:
             return
-        try:
-            import task_metrics as tm
-        except ImportError:  # pragma: no cover - optional dependency
-            return
+
+        import task_metrics as tm
+
         self._emit("")
         self._emit("Task quality read-outs  (untrained heads at this checkpoint)")
         self._emit("")
@@ -1403,9 +1245,6 @@ class GradientDiagnostics:
             suffix = "" if value is not None else "   # task not measured"
             self._emit(f"      {task}: {value if value is not None else 1.0}{suffix}")
 
-    # ------------------------------------------------------------------
-    # output files
-    # ------------------------------------------------------------------
     def _row(
         self, virtual_batch: int, metric: str, task_a: str, task_b: str, value: float
     ) -> None:
@@ -1501,18 +1340,13 @@ class GradientDiagnostics:
             "summary": self.summary(),
             "task_metrics": self.task_metrics(),
             "suggested_weights": self.suggested_weights(),
-            # Every snapshot taken so far, oldest first: the time series.
-            # Empty for a one-shot run.
+            # Every snapshot so far, oldest first; empty for a one-shot run.
             "snapshots": self.snapshots,
         }
 
     def _write_outputs(self, snapshot_step: Optional[int] = None) -> None:
-        """Write the artifacts.
-
-        `snapshot_step` writes a self-contained per-snapshot pair
-        (`gradient_diagnostics_step-000480.{txt,json}`) alongside the cumulative
-        TSV, so a snapshot stays readable on its own and nothing an earlier
-        snapshot wrote is overwritten. Called with no step for the final report.
+        """Write the artifacts; `snapshot_step` writes a self-contained
+        `gradient_diagnostics_step-NNNNNN.{txt,json}` pair beside the cumulative TSV.
         """
         if not self.output_dir:
             return
@@ -1541,10 +1375,7 @@ class GradientDiagnostics:
 
         written = [txt_path, json_path, tsv_path]
 
-        # Optional shared sweep file: append so several runs (different scopes,
-        # batch sizes, K, checkpoints, loss weights) land in one table for
-        # cross-run plots. Only rows added since the last write go out, or every
-        # snapshot would re-append the whole history.
+        # Shared sweep file: append only new rows, or snapshots re-append history.
         if self.config.records_path and len(self._rows) > self._rows_flushed:
             shared = self.config.records_path
             os.makedirs(os.path.dirname(shared) or ".", exist_ok=True)
@@ -1562,7 +1393,6 @@ class GradientDiagnostics:
         for path in written:
             print(f"   {path}")
 
-    # ------------------------------------------------------------------
     def _warn_once(self, key: str, message: str) -> None:
         if key not in self._warned:
             self._warned.add(key)

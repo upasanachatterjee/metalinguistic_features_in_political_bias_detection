@@ -1,20 +1,6 @@
-"""Evaluation metrics for the tone and theme objectives.
-
-Pretraining loss alone is a poor read on whether these two heads learned
-anything useful:
-
-* **Tone MSE** is dominated by the target's mean offset. GDELT tone over this
-  corpus has mean ~-2.7 and std ~2.8, so 47% of the MSE of a zero-predicting
-  head is the offset alone -- a head that learns the corpus mean and nothing
-  else scores respectably. Correlation is what separates that from a head that
-  actually tracks the target.
-* **Theme BCE** is dominated by easy negatives: a document carries ~37 positive
-  themes out of 2000, so ~98% of every target vector is zeros. A head that
-  scores everything well under 0.5 gets a respectable loss and zero F1.
-
-Nothing here is wired into the optimizer; these are read-outs. The gradient
-diagnostic collects predictions as it runs and reports them, and fine-tuning /
-evaluation code can call the two entry points directly.
+"""Read-outs for the tone and theme objectives, wired into nothing: tone MSE is
+dominated by the target's mean offset and theme BCE by easy negatives, so neither
+loss says whether its head learned anything. Correlation and F1 do.
 """
 
 from __future__ import annotations
@@ -25,12 +11,10 @@ import numpy as np
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import average_precision_score, f1_score
 
-# Labels/predictions with fewer than this many finite pairs make correlation
-# meaningless rather than merely noisy.
+# Below this, correlation is undefined rather than merely noisy.
 MIN_CORRELATION_SAMPLES = 3
 
-# Prevalence bands the theme report groups labels into, as (name, low, high)
-# with `low <= prevalence < high`.
+# Prevalence bands as (name, low, high), with `low <= prevalence < high`.
 PREVALENCE_GROUPS = (
     ("rare (<1%)", 0.0, 0.01),
     ("uncommon (1-10%)", 0.01, 0.10),
@@ -39,13 +23,8 @@ PREVALENCE_GROUPS = (
 
 
 def _safe_correlation(fn, x: np.ndarray, y: np.ndarray) -> Optional[float]:
-    """Correlation, or None when it is undefined rather than merely small.
-
-    A constant prediction vector (common very early in training, when the head
-    still outputs roughly its bias term) makes the denominator zero; scipy
-    returns NaN with a warning. None says "not measurable" instead of pretending
-    the correlation is 0.
-    """
+    """Correlation, or None when it is undefined rather than merely small."""
+    # A constant prediction vector zeroes the denominator; None beats pretending 0.
     if x.size < MIN_CORRELATION_SAMPLES:
         return None
     if np.allclose(x, x[0]) or np.allclose(y, y[0]):
@@ -57,25 +36,11 @@ def _safe_correlation(fn, x: np.ndarray, y: np.ndarray) -> Optional[float]:
 def tone_metrics(
     predictions: Sequence[float], targets: Sequence[float]
 ) -> Dict[str, Any]:
-    """Score tone regression, in GDELT tone units throughout.
-
-    Targets are never rescaled, so MSE/RMSE/MAE are directly comparable across
-    runs and directly interpretable: an MAE of 2 means the head is off by two
-    tone points, on a field whose corpus std is ~2.8.
-
-    The correlations are the point of this function. MSE alone cannot
-    distinguish a head that has learned the corpus mean (~-2.7) and nothing else
-    from one that tracks the target -- the first scores respectably. Pearson and
-    Spearman are scale-free and answer the question MSE gets used as a proxy for.
-    The reported prediction spread makes the same failure visible directly: a
-    mean-only head has a near-zero std.
+    """Score tone regression in GDELT tone units throughout, targets never rescaled.
+    The correlations are the point: MSE cannot tell a mean-only head from a real one.
     """
     preds = np.asarray(predictions, dtype=np.float64).reshape(-1)
     gold = np.asarray(targets, dtype=np.float64).reshape(-1)
-    if preds.shape != gold.shape:
-        raise ValueError(
-            f"tone predictions {preds.shape} and targets {gold.shape} disagree."
-        )
     if preds.size == 0:
         return {"count": 0}
 
@@ -146,29 +111,16 @@ def theme_metrics(
     threshold: float = 0.5,
     group_by_prevalence: bool = True,
 ) -> Dict[str, Any]:
-    """Score multi-label theme prediction.
-
-    `logits` are raw head outputs; they are squashed with a sigmoid here.
-
-    F1 uses a fixed `threshold`; average precision is threshold-free and is the
-    more honest number when almost every label is rare -- report both.
-    Prevalence for the grouped breakdown is measured on the labels passed in.
+    """Score multi-label theme prediction from raw `logits`, sigmoid-squashed here.
+    Report both F1 (fixed `threshold`) and the threshold-free average precision.
     """
     scores = 1.0 / (1.0 + np.exp(-np.asarray(logits, dtype=np.float64)))
     gold = np.asarray(labels).astype(np.int64)
-    if scores.shape != gold.shape:
-        raise ValueError(
-            f"theme logits {scores.shape} and labels {gold.shape} disagree."
-        )
-    if scores.ndim != 2:
-        raise ValueError(f"Expected (examples, labels), got {scores.shape}.")
     if scores.shape[0] == 0:
         return {"count": 0}
 
     predicted = (scores >= threshold).astype(np.int64)
-    # Labels with no positives here have undefined AP; excluding them from the
-    # macro average is the difference between "the head is bad" and "the
-    # evaluation set never showed this theme".
+    # Labels with no positives have undefined AP; excluding them is the honest choice.
     scorable = np.flatnonzero(gold.sum(axis=0) > 0)
 
     metrics: Dict[str, Any] = {

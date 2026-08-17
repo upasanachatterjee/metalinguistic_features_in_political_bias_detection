@@ -1,15 +1,6 @@
-"""Which rows of the corpus a run actually trains on.
-
-Two selection rules, applied in this order and both computed at the Arrow
-level rather than through ``Dataset.filter``:
-
-1. **Non-empty themes and tone** (optional, ``require_nonempty_themes_and_tone``)
-   -- keep only rows where GDELT's ``V2Themes`` and ``V2Tone`` are both
-   populated. Without it the theme and tone heads train largely on empty labels.
-2. **Title dedup** (always, when the corpus has a ``title`` column) -- keep the
-   first row of each distinct title and drop untitled rows outright. Scoped to
-   the rows that survived rule 1, so a title whose first copy was filtered out
-   falls back to its next surviving copy instead of disappearing.
+"""Which rows of the corpus a run trains on: an optional non-empty themes/tone
+filter, then title dedup, both computed at the Arrow level rather than through
+`Dataset.filter`.
 """
 
 import hashlib
@@ -92,9 +83,7 @@ def _build_or_load_first_title_index(
         t0 = time.perf_counter()
 
         col = dataset_raw.data.column("title")
-        # Dictionary-encode so dedup happens over int32 codes instead of strings.
-        # Null titles encode to null indices; fill them with -1 so the array stays
-        # integer-typed, and track them in `has_title` so they can be dropped.
+        # Dictionary-encoded so dedup runs over int32 codes; nulls fill to -1.
         if len(col) == 0:
             # A zero-row column has zero chunks, which np.concatenate rejects.
             codes = np.zeros(0, dtype=np.int32)

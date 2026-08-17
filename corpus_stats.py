@@ -1,33 +1,6 @@
-"""Training-split statistics for the tone and theme objectives.
-
-Both are computed over exactly the rows a run trains on -- same dataset, same
-``require_nonempty_themes_and_tone`` filter, same title dedup -- because this
-builds the run's own ``MemoryEfficientDataset`` rather than re-deriving the
-selection. Both refuse a non-train split::
-
-    python corpus_stats.py --config run_configs/grad_diagnostics.yaml \\
-        --out ./corpus_stats
-
-**Tone.** Describes the regression target: how much of it is spread and how much
-is a constant offset, which is what says whether a low tone loss means anything.
-Parsing goes through ``RegressionCollator``'s own ``parse_regression_values``, so
-the values audited here are byte-for-byte the values the collator feeds the
-model. Purely descriptive -- targets are trained in GDELT's own units and nothing
-consumes these numbers.
-
-**Themes.** Counts positives per theme over the same rows -- how rare the rare
-themes are, and how much of the label space a document actually touches. Parsing
-goes through
-``MultiLabelCollator``'s ``parse_multilabel`` and the same ``top_themes.txt``
-label ordering.
-
-
-Outputs (into ``--out``)
-------------------------
-``tone_stats.json``          count/mean/std/min/max/median/p1/p5/p95/p99
-``theme_label_stats.json``   summary + one record per theme
-``theme_label_stats.csv``    the per-theme records, for spreadsheets/plots
-``corpus_stats.txt``         the printed summary, verbatim
+"""Descriptive tone and theme statistics over exactly the rows a run trains on, since
+it builds the run's own `MemoryEfficientDataset` and parses through the collators' own
+`parse_regression_values` / `parse_multilabel`.
 """
 
 from __future__ import annotations
@@ -47,8 +20,7 @@ from collators.regression_collator import parse_regression_values
 from config import RunConfig, load_run_config
 from dataset import MemoryEfficientDataset
 
-# Rows pulled out of the Arrow table per chunk. Only bounds peak memory of the
-# python-object conversion; the numbers are identical at any chunk size.
+# Chunk size bounds peak memory only; the numbers are identical at any size.
 CHUNK_ROWS = 100_000
 
 # Prevalence bands the theme audit reports counts for.
@@ -70,9 +42,6 @@ def _iter_column(dataset, column: str):
         yield table.column(column)[start:end].to_pylist()
 
 
-# ----------------------------------------------------------------------
-# tone
-# ----------------------------------------------------------------------
 def compute_tone_stats(dataset, output_size: int = 1) -> Dict[str, Any]:
     """Fixed tone statistics over the training rows.
 
@@ -92,9 +61,6 @@ def compute_tone_stats(dataset, output_size: int = 1) -> Dict[str, Any]:
                 continue
             values.append(parsed[0])
 
-    if not values:
-        raise ValueError("No parseable V2Tone values in the training split.")
-
     array = np.asarray(values, dtype=np.float64)
     mean = float(array.mean())
     # ddof=0: this is the whole training population, not a sample of it.
@@ -109,18 +75,13 @@ def compute_tone_stats(dataset, output_size: int = 1) -> Dict[str, Any]:
         "max": float(array.max()),
         "median": float(np.median(array)),
         **_percentiles(array, {"p1": 1, "p5": 5, "p95": 95, "p99": 99}),
-        # How much of the MSE a zero-predicting head starts with is just the
-        # mean offset. A large share means early tone loss says more about the
-        # corpus being systematically negative than about anything learned.
+        # A large share means early tone loss reflects the corpus, not learning.
         "mean_offset_share_of_initial_mse": (
             mean**2 / mean_square if mean_square > 0 else 0.0
         ),
     }
 
 
-# ----------------------------------------------------------------------
-# themes
-# ----------------------------------------------------------------------
 def compute_theme_stats(dataset, themes_path: str) -> Dict[str, Any]:
     """Per-theme positive counts and label-density summary over training rows.
 
@@ -139,8 +100,7 @@ def compute_theme_stats(dataset, themes_path: str) -> Dict[str, Any]:
             num_examples += 1
             themes = parse_multilabel(raw)
             if not themes:
-                # None (missing) and "" (present but empty) both collate to an
-                # all-zero target vector, exactly as counted here.
+                # Missing and empty both collate to an all-zero target, exactly as counted.
                 positives_per_example.append(0)
                 continue
             indices = {
@@ -151,9 +111,6 @@ def compute_theme_stats(dataset, themes_path: str) -> Dict[str, Any]:
             for idx in indices:
                 positive_counts[idx] += 1
             positives_per_example.append(len(indices))
-
-    if num_examples == 0:
-        raise ValueError("No rows in the training split; nothing to audit.")
 
     per_example = np.asarray(positives_per_example, dtype=np.int64)
     with_positive = int((per_example > 0).sum())
@@ -194,9 +151,6 @@ def compute_theme_stats(dataset, themes_path: str) -> Dict[str, Any]:
     return {"summary": summary, "per_label": per_label}
 
 
-# ----------------------------------------------------------------------
-# reporting
-# ----------------------------------------------------------------------
 def tone_report_lines(stats: Dict[str, Any]) -> List[str]:
     lines = ["", "TONE (training split only)", "-" * 60]
     for key in (

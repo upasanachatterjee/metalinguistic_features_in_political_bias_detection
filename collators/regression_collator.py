@@ -54,15 +54,8 @@ def parse_regression_values(
     row_string: Optional[str], output_size: int = 1
 ) -> Optional[List[float]]:
     """
-    Parse comma-separated string and return the first output_size values as floats.
-    If fewer values exist, pad with zeros.
-
-    Args:
-        row_string: Comma-separated string of float values
-        output_size: Number of values to return
-
-    Returns:
-        List of float values, or None if parsing fails
+    First `output_size` comma-separated floats, zero-padded if there are fewer, or
+    None if parsing fails.
     """
     if row_string is None:
         return None

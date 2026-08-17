@@ -20,13 +20,9 @@ NUM_THEMES = 2000
 
 
 def load_model(model_ref: str):
-    """Load one of the study's models, ready for bias classification.
-
-    `model_ref` is either a hub name from HUB_BASELINES, a path to a
-    MultiTaskRoberta `.pt` checkpoint, or a directory holding a legacy
-    `pytorch_model.bin`. Returns (tokenizer, model); the tokenizer is always
-    roberta-base's for the checkpoint paths, since that is the backbone they
-    were pretrained on.
+    """Load a hub name, a MultiTaskRoberta `.pt`, or a legacy `pytorch_model.bin`
+    directory, ready for bias classification. Checkpoints always get roberta-base's
+    tokenizer.
     """
     if model_ref in HUB_BASELINES:
         tokenizer = AutoTokenizer.from_pretrained(model_ref)
@@ -42,15 +38,10 @@ def load_model(model_ref: str):
 
 
 def _load_multitask_checkpoint(path: str):
-    """Rebuild MultiTaskRoberta from a pretraining checkpoint, plus a bias head.
-
-    The bias head is new (pretraining never trains one), so it starts random --
-    hence `strict=False`. The tone head size is read back from the weights
-    because it has changed across runs.
-    """
+    """Rebuild MultiTaskRoberta from a pretraining checkpoint, plus a bias head."""
+    # The bias head is new (`strict=False`); tone size is read back from the weights.
     checkpoint = torch.load(path, map_location="cpu")
-    # Either a full checkpoint dict from MultiTaskRoberta.save_checkpoint, or a
-    # bare state dict from an older run.
+    # A save_checkpoint dict, or a bare state dict from an older run.
     state = (
         checkpoint["model_state_dict"]
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint

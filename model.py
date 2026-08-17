@@ -33,20 +33,11 @@ class ClassificationHead(nn.Module):
 
 
 class MultiTaskRoberta(nn.Module):
-    """Shared RoBERTa backbone with one head per task.
-
-    `forward` dispatches on which prefixed keys are present in kwargs
-    (`triplet_*`, `theme_*`, `tone_*`, `mlm_*`), so a single call can
-    carry any subset of the tasks; `pretraining.TASK_BATCH_KEYS` is the mapping
-    from collator output to those keys. `bias_*` dispatches the same way but
-    belongs to fine-tuning alone.
-
-    `outputs["<task>_loss"]` is always the RAW, unweighted task loss;
-    `outputs["<task>_weighted_loss"]` is that loss times its `loss_weights`
-    entry, i.e. exactly the term that went into `outputs["loss"]`. Logging and
-    the gradient diagnostic read the raw key, so the numbers stay comparable
-    across weightings.
+    """Shared RoBERTa backbone with one head per task; `forward` dispatches on which
+    prefixed keys are present, so one call carries any subset of them.
     """
+
+    # `<task>_loss` is RAW, `<task>_weighted_loss` is what entered `loss`.
 
     TRIPLET_MARGIN = 1.0
 
@@ -83,16 +74,13 @@ class MultiTaskRoberta(nn.Module):
         if self.num_bias_classes is not None:
             self.bias_head = ClassificationHead(num_bias_classes, hidden_size=hid)
 
-        # MLM head - create just the head, not the full model
-        # Load the full MLM model temporarily to get the LM head
+        # Lift the LM head off a throwaway MLM model.
         mlm_model = AutoModelForMaskedLM.from_pretrained(name)
         self.lm_head = mlm_model.lm_head
         # Clean up the temporary model
         del mlm_model
 
-        # When True, `forward` also returns detached triplet geometry under
-        # `outputs["triplet_stats"]`. Off during normal training: each entry is
-        # a GPU->CPU sync that the training loop has no use for.
+        # Off in training: each triplet_stats entry is a GPU->CPU sync no one reads.
         self.collect_triplet_stats = False
 
         # Per-task objectives. Stateless, so they carry no state_dict entries.
@@ -105,9 +93,7 @@ class MultiTaskRoberta(nn.Module):
     # Add these methods to support gradient checkpointing
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Enable gradient checkpointing for the backbone model"""
-        # Reentrant checkpointing is incompatible with DDP when a module is
-        # forwarded multiple times per step (we run the backbone for triplet
-        # a/p/n + themes + tone + mlm), so force the non-reentrant variant.
+        # Reentrant checkpointing breaks DDP when the backbone is forwarded 6x per step.
         if gradient_checkpointing_kwargs is None:
             gradient_checkpointing_kwargs = {}
         gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
@@ -155,8 +141,6 @@ class MultiTaskRoberta(nn.Module):
             if self.collect_triplet_stats:
                 outputs["triplet_stats"] = self._triplet_stats(za, zp, zn)
 
-        # --- Classification Tasks (Themes & Tone) ---
-        # Theme Task
         if "theme_labels" in kwargs and "theme_input_ids" in kwargs:
             input_ids, attention_mask = (
                 kwargs["theme_input_ids"],
@@ -188,8 +172,7 @@ class MultiTaskRoberta(nn.Module):
             outputs["tone_weighted_loss"] = weighted
             outputs["tone_logits"] = tone_logits
 
-        # --- Single-Class Classification Task (e.g., Bias/Ideology) ---
-        # Fine-tuning only, and there it is the ONLY objective
+        # Fine-tuning only, and there it is the ONLY objective.
         if "bias_labels" in kwargs and "bias_input_ids" in kwargs:
             assert self.num_bias_classes is not None, (
                 "num_bias_classes must be set during model initialization for classification."
@@ -237,14 +220,8 @@ class MultiTaskRoberta(nn.Module):
     def _triplet_stats(
         self, za: torch.Tensor, zp: torch.Tensor, zn: torch.Tensor
     ) -> Dict[str, float]:
-        """Geometry behind the triplet loss, for the gradient diagnostic.
-
-        `nn.TripletMarginLoss` reports only `relu(violation).mean()`, which hides
-        why the triplet gradient is noisy: a batch of easy triplets (all
-        violations negative) contributes nothing at all, and one with a handful
-        of active triplets contributes a gradient built from those few. These
-        numbers separate the two cases.
-        """
+        """Geometry behind the triplet loss, for the gradient diagnostic."""
+        # TripletMarginLoss hides whether a batch was all-easy or carried by a few.
         with torch.no_grad():
             d_pos = F.pairwise_distance(za, zp, p=2)
             d_neg = F.pairwise_distance(za, zn, p=2)

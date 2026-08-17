@@ -30,7 +30,8 @@ class TrainArgs:
     num_epochs: int = 3  # Number of epochs to train for
     warmup_ratio: float = 0.06
     batch_size: int = 32
-    log_every: int = 5000
+    # None => `prepare_run` derives ~15 log lines per epoch from the step count.
+    log_every: Optional[int] = None
     gradient_accumulation_steps: int = 1
     # None runs `num_epochs` to completion.
     max_steps: Optional[int] = None
@@ -41,15 +42,9 @@ class TrainArgs:
 
 @dataclass
 class LossWeights:
-    """
-    Weights scale `total_loss` only; the per-task losses that get logged and
-    diagnosed stay raw, so numbers remain comparable across weightings.
+    """Weights scale `total_loss` only; logged and diagnosed losses stay raw."""
 
-    The fields must mirror `model.DEFAULT_LOSS_WEIGHTS`: `setup_model` passes
-    `as_dict()` straight into `MultiTaskRoberta`, which rejects unknown names.
-    There is deliberately no `bias` weight -- that task exists only in
-    fine-tuning, where it is the sole objective.
-    """
+    # Must mirror `model.DEFAULT_LOSS_WEIGHTS`
 
     triplet: float = 1.0
     themes: float = 1.0
@@ -86,8 +81,7 @@ class RunConfig:
         )
     )
     loss_weights: LossWeights = field(default_factory=LossWeights)
-    # Multi-task gradient diagnostic; disabled by default so normal training
-    # behaviour is unchanged.
+    # Disabled by default
     gradient_diagnostics: GradientDiagnosticsConfig = field(
         default_factory=GradientDiagnosticsConfig
     )
