@@ -64,13 +64,14 @@ class CustomTrainer(Trainer):
 
 
 BIAS_CLASSES = (0, 1, 2)
+_CORNER = "true\\pred"
 
 
 def format_confusion_matrix(labels: np.ndarray, predictions: np.ndarray) -> str:
     """The confusion matrix as printable text, rows = true, columns = predicted."""
-    matrix = confusion_matrix(labels, predictions, labels=range(len(BIAS_CLASSES)))
-    cell = max(len(name) for name in BIAS_CLASSES) + 3
-    header = f"{'true\\pred':>{cell}}" + "".join(
+    matrix = confusion_matrix(labels, predictions, labels=BIAS_CLASSES)
+    cell = max(len(_CORNER), *(len(str(name)) for name in BIAS_CLASSES)) + 2
+    header = f"{_CORNER:>{cell}}" + "".join(
         f"{name:>{cell}}" for name in BIAS_CLASSES
     )
     rows = [
