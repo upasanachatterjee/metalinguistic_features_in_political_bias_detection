@@ -10,12 +10,12 @@ load_dotenv()
 
 
 def undersample_per_topic(dataset: Dataset) -> Dataset:
-    """Undersample `int_bias` to its smallest class within each topic, dropping rows
+    """Undersample `bias` to its smallest class within each topic, dropping rows
     with a null topic.
     """
     # Per topic rather than globally, or the model learns topic as a proxy for bias.
     topics = np.array(dataset["topic"])
-    labels = np.array(dataset["int_bias"])
+    labels = np.array(dataset["bias"])
     all_indices = []
 
     # Filter out None topics
@@ -77,7 +77,7 @@ def clean_dataset_optimized(
     """Balance and tokenize a bias split, truncating at `max_length` so one article is
     one row. `use_bias_keys` picks MultiTaskRoberta's `bias_*` names over the plain ones.
     """
-    print("Initial label distribution:", Counter(dataset["int_bias"]))
+    print("Initial label distribution:", Counter(dataset["bias"]))
 
     if len(dataset) < 1:
         return None
@@ -91,10 +91,10 @@ def clean_dataset_optimized(
     prepared = prepared.flatten()
 
     if use_bias_keys:
-        prepared = prepared.rename_column("int_bias", "bias_labels")
+        prepared = prepared.rename_column("bias", "bias_labels")
         prepared = prepared.select_columns(["bias_labels", "text", "id"])
     else:
-        prepared = prepared.rename_column("int_bias", "labels")
+        prepared = prepared.rename_column("bias", "labels")
         prepared = prepared.select_columns(["labels", "text", "id"])
 
     def tokenize_batch(exs: Dict[str, List[Any]]) -> Dict[str, Any]:

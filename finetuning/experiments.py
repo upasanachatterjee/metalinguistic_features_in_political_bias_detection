@@ -115,7 +115,7 @@ def run_single(
 
 
 def _load_dataset_by_config(dataset_config: DatasetConfig) -> DatasetDict:
-    """Load one of the two AllSides splits, which already carry int_bias/text/id."""
+    """Load one of the two AllSides splits, which already carry bias/text/id."""
     # Neither ships a validation split; test stands in, and only drives early stopping.
     ds = load_dataset(dataset_config.custom_dataset or ALLSIDES_BASE_MEDIA_SPLIT)
     if not ds.get("validation"):
