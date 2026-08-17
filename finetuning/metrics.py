@@ -1,5 +1,6 @@
 from sklearn.metrics import (
     accuracy_score,
+    confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
@@ -60,6 +61,24 @@ class CustomTrainer(Trainer):
         if prediction_loss_only:
             return (loss, None, None)
         return (loss, logits, labels)
+
+
+BIAS_CLASSES = (0, 1, 2)
+
+
+def format_confusion_matrix(labels: np.ndarray, predictions: np.ndarray) -> str:
+    """The confusion matrix as printable text, rows = true, columns = predicted."""
+    matrix = confusion_matrix(labels, predictions, labels=range(len(BIAS_CLASSES)))
+    cell = max(len(name) for name in BIAS_CLASSES) + 3
+    header = f"{'true\\pred':>{cell}}" + "".join(
+        f"{name:>{cell}}" for name in BIAS_CLASSES
+    )
+    rows = [
+        f"{BIAS_CLASSES[index]:>{cell}}"
+        + "".join(f"{count:>{cell}d}" for count in row)
+        for index, row in enumerate(matrix)
+    ]
+    return "\n".join(["confusion matrix", header, *rows])
 
 
 def _compute_classification_metrics(
@@ -127,6 +146,7 @@ def compute_metrics(eval_pred) -> Dict[str, Any]:
         logits = logits[0]
 
     predictions = np.argmax(np.asarray(logits), axis=-1)
+    print(format_confusion_matrix(np.asarray(labels), predictions))
     return _compute_classification_metrics(predictions, labels)
 
 
@@ -144,6 +164,8 @@ def batched_predict_metrics_trainer(
     if not dataset:
         return {}
 
+    chunk_compute_metrics, trainer.compute_metrics = trainer.compute_metrics, None
+
     for start in range(0, len(dataset), batch_size):
         end = min(start + batch_size, len(dataset))
         chunk = dataset.select(range(start, end))
@@ -160,9 +182,13 @@ def batched_predict_metrics_trainer(
         all_labels.append(labels)
         all_ids.extend(ids)
 
+    trainer.compute_metrics = chunk_compute_metrics
+
     predicted = np.argmax(np.concatenate(all_logits, axis=0), axis=1)
     actual = np.concatenate(all_labels, axis=0)
     ids = list(all_ids)
+
+    print(format_confusion_matrix(actual, predicted))
 
     if len(set(ids)) != len(ids):
         print(

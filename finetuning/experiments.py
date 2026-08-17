@@ -31,6 +31,7 @@ class ExperimentConfig:
     num_epochs: int = 15
     save_model: bool = False
     seed: int = 42
+    batch_size: Optional[int] = None
 
 
 @dataclass
@@ -42,6 +43,7 @@ ALLSIDES_BASE_MEDIA_SPLIT = "upasanachatterjee/AllSides-media-split"
 ALLSIDES_BASE_RANDOM_SPLIT = "upasanachatterjee/AllSides-random-split"
 _BATCH_SIZE = 32
 _GRAD_ACCUMULATION = 4
+_EFFECTIVE_BATCH_SIZE = _BATCH_SIZE * _GRAD_ACCUMULATION
 _NUM_WORKERS = 8
 _EVAL_BATCH_SIZE = 32
 _MAX_LENGTH = 512
@@ -158,7 +160,10 @@ def make_training_args(
     batch_size_override: Optional[int] = None,
     seed: int = 42,
 ) -> TrainingArguments:
-    """Shared HF TrainingArguments for every finetuning run in this study."""
+    """Shared HF TrainingArguments for every finetuning run in this study, with
+    accumulation derived so any batch size gives the same effective batch.
+    """
+    batch_size = batch_size_override or _BATCH_SIZE
     return TrainingArguments(
         output_dir=output_dir,
         save_strategy="epoch",
@@ -169,8 +174,8 @@ def make_training_args(
         learning_rate=learning_rate,
         gradient_checkpointing=True,
         fp16=True,
-        per_device_train_batch_size=batch_size_override or _BATCH_SIZE,
-        gradient_accumulation_steps=_GRAD_ACCUMULATION,
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=max(1, _EFFECTIVE_BATCH_SIZE // batch_size),
         dataloader_num_workers=_NUM_WORKERS,
         load_best_model_at_end=True,
         metric_for_best_model="eval_f1_macro",
@@ -182,6 +187,16 @@ def make_training_args(
         seed=seed,
         remove_unused_columns=False,
     )
+
+
+def optimizer_steps_per_epoch(training_args: TrainingArguments, train_rows: int) -> int:
+    """Optimizer steps one epoch completes, i.e. the unit `logging_strategy='epoch'`
+    logs in.
+    """
+    world_size = max(1, training_args.world_size)
+    batches = train_rows // (training_args.per_device_train_batch_size * world_size)
+    return batches // training_args.gradient_accumulation_steps
+
 
 
 def count_unique_ids(dataset) -> int:
@@ -258,8 +273,13 @@ def train_model(
     """Fine-tune on train, early-stop on validation, score on test. Returns the test
     metrics with the training arguments attached; validation only selects the model.
     """
-    training_args = make_training_args(num_epochs=experiment_config.num_epochs, seed=experiment_config.seed)
+    training_args = make_training_args(
+        num_epochs=experiment_config.num_epochs,
+        seed=experiment_config.seed,
+        batch_size_override=experiment_config.batch_size,
+    )
     print("per_device_train_batch_size=", training_args.per_device_train_batch_size)
+    print("gradient_accumulation_steps=", training_args.gradient_accumulation_steps)
 
     trainer = make_trainer(
         model,
