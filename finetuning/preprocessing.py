@@ -92,20 +92,20 @@ def clean_dataset_optimized(
 
     if use_bias_keys:
         prepared = prepared.rename_column("bias", "bias_labels")
-        prepared = prepared.select_columns(["bias_labels", "text", "id"])
+        prepared = prepared.select_columns(["bias_labels", "content", "ID"])
     else:
         prepared = prepared.rename_column("bias", "labels")
-        prepared = prepared.select_columns(["labels", "text", "id"])
+        prepared = prepared.select_columns(["labels", "content", "ID"])
 
     def tokenize_batch(exs: Dict[str, List[Any]]) -> Dict[str, Any]:
         return tokenizer(
-            exs["text"], padding="max_length", truncation=True, max_length=max_length
+            exs["content"], padding="max_length", truncation=True, max_length=max_length
         )
 
     tokenized = prepared.map(
         tokenize_batch,
         batched=True,
-        remove_columns=["text"],  # no longer need raw text after tokenization
+        remove_columns=["content"],  # no longer need raw content after tokenization
         num_proc=num_proc,
     )
     if use_bias_keys:

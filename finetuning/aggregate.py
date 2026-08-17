@@ -543,7 +543,7 @@ def per_example_frame(runs: Sequence[RunResult]) -> pd.DataFrame:
     num_classes = int(max(preds.max(), labels.max())) + 1
     counts = _vote_counts(preds, num_classes)
 
-    frame = pd.DataFrame({"id": ids, "label": labels})
+    frame = pd.DataFrame({"ID": ids, "label": labels})
     for row, run in enumerate(runs):
         frame[f"seed_{run.seed}"] = preds[row]
 

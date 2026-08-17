@@ -185,7 +185,7 @@ def make_training_args(
 
 def count_unique_ids(dataset) -> int:
     """Number of distinct article ids, i.e. rows before any per-id aggregation."""
-    return len(dataset.to_pandas()["id"].unique()) if dataset else 0
+    return len(dataset.to_pandas()["ID"].unique()) if dataset else 0
 
 
 def add_row_counts(metrics: dict, datasets: dict) -> None:

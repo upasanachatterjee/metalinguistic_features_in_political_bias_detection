@@ -139,7 +139,7 @@ def batched_predict_metrics_trainer(
     for start in range(0, len(dataset), batch_size):
         end = min(start + batch_size, len(dataset))
         chunk = dataset.select(range(start, end))
-        ids = chunk["id"]
+        ids = chunk["ID"]
         output = trainer.predict(chunk)
 
         logits = output.predictions
