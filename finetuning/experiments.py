@@ -184,6 +184,7 @@ def make_training_args(
         adam_beta2=0.999,
         warmup_ratio=0.06,
         save_safetensors=False,
+        disable_tqdm=True,
         seed=seed,
         remove_unused_columns=False,
     )
@@ -296,6 +297,7 @@ def train_model(
     cleanup()
 
     test_metrics = evaluate_and_cleanup(trainer, test_ds)
+    test_metrics["log_history"] = trainer.state.log_history
     test_metrics["training_args"] = training_args_to_dict(
         training_args, experiment_config.patience
     )
