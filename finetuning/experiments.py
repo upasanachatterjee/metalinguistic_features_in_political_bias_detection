@@ -291,7 +291,7 @@ def train_model(
     cleanup()
 
     test_metrics = evaluate_and_cleanup(trainer, test_ds)
-    test_metrics["log_history"] = trainer.state.log_history
+    # test_metrics["log_history"] = trainer.state.log_history
     test_metrics["training_args"] = training_args_to_dict(
         training_args, experiment_config.patience
     )
