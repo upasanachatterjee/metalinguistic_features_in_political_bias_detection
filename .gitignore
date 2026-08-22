@@ -7,3 +7,4 @@ finetuning-results/*
 !README.md
 cache/
 docs/
+subsample_*

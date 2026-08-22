@@ -47,6 +47,7 @@ class MultiTaskRoberta(nn.Module):
         num_tones=1,
         num_themes=2000,
         num_bias_classes=None,
+        num_relevance_facets=None,
         loss_weights=None,
     ):
         super().__init__()
@@ -74,6 +75,13 @@ class MultiTaskRoberta(nn.Module):
         if self.num_bias_classes is not None:
             self.bias_head = ClassificationHead(num_bias_classes, hidden_size=hid)
 
+        # Fine-tuning only, like the bias head: MITweet's 12-facet relevance task.
+        self.num_relevance_facets = num_relevance_facets
+        if self.num_relevance_facets is not None:
+            self.relevance_head = ClassificationHead(
+                num_relevance_facets, hidden_size=hid
+            )
+
         # Lift the LM head off a throwaway MLM model.
         mlm_model = AutoModelForMaskedLM.from_pretrained(name)
         self.lm_head = mlm_model.lm_head
@@ -88,6 +96,7 @@ class MultiTaskRoberta(nn.Module):
         self.theme_loss_fct = nn.BCEWithLogitsLoss()
         self.tone_loss_fct = nn.MSELoss()
         self.bias_loss_fct = nn.CrossEntropyLoss()
+        self.relevance_loss_fct = nn.BCEWithLogitsLoss()
         self.mlm_loss_fct = nn.CrossEntropyLoss()
 
     # Add these methods to support gradient checkpointing
@@ -188,6 +197,24 @@ class MultiTaskRoberta(nn.Module):
             outputs["bias_loss"] = bias_loss
             outputs["bias_logits"] = bias_logits
 
+        # Fine-tuning only. RelevanceTrainer recomputes this loss with a pos_weight.
+        if "relevance_labels" in kwargs and "relevance_input_ids" in kwargs:
+            assert self.num_relevance_facets is not None, (
+                "num_relevance_facets must be set during model initialization for relevance."
+            )
+            input_ids, attention_mask = (
+                kwargs["relevance_input_ids"],
+                kwargs["relevance_attention_mask"],
+            )
+            pooled = self.forward_single(input_ids, attention_mask)
+            relevance_logits = self.relevance_head(pooled)
+            relevance_loss = self.relevance_loss_fct(
+                relevance_logits, kwargs["relevance_labels"].float()
+            )
+            total_loss += relevance_loss
+            outputs["relevance_loss"] = relevance_loss
+            outputs["relevance_logits"] = relevance_logits
+
         # --- MLM Task ---
         if "mlm_input_ids" in kwargs:
             input_ids, attention_mask = (
@@ -259,6 +286,8 @@ class MultiTaskRoberta(nn.Module):
         }
         if self.num_bias_classes is not None:
             config["num_bias_classes"] = self.num_bias_classes
+        if self.num_relevance_facets is not None:
+            config["num_relevance_facets"] = self.num_relevance_facets
 
         checkpoint = {
             "model_state_dict": self.state_dict(),

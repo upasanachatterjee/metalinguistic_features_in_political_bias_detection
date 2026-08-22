@@ -15,21 +15,26 @@ import torch
 import torch.nn.functional as F
 
 
+def _first_present(mapping, *keys):
+    """The first of `keys` present in `mapping` with a non-None value, else None."""
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None:
+            return value
+    return None
+
+
 def _unpack(inputs, outputs):
     """Pull (labels, logits, loss) out of a batch/output pair, any of which may be
-    None. Prefers MultiTaskRoberta's `bias_*` keys, falling back to the plain names.
+    None. Prefers MultiTaskRoberta's `relevance_*`/`bias_*` keys over the plain names.
     """
-    labels = inputs.get("bias_labels")
-    if labels is None:
-        labels = inputs.get("labels")
+    labels = _first_present(inputs, "relevance_labels", "bias_labels", "labels")
 
     if isinstance(outputs, dict):
-        logits = outputs.get("bias_logits")
-        if logits is None:
-            logits = outputs.get("logits")
-        loss = outputs.get("bias_loss")
-        if loss is None:
-            loss = outputs.get("loss")
+        logits = _first_present(
+            outputs, "relevance_logits", "bias_logits", "logits"
+        )
+        loss = _first_present(outputs, "relevance_loss", "bias_loss", "loss")
     else:
         logits = getattr(outputs, "logits", outputs)
         loss = getattr(outputs, "loss", None)

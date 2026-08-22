@@ -13,6 +13,13 @@ from .metrics import (
     CustomTrainer,
     WholeEpochCounter,
 )
+from .mitweet import MITweetConfig, load_mitweet, variant_name
+from .mitweet_metrics import (
+    RelevanceTrainer,
+    batched_predict_ideology,
+    batched_predict_relevance,
+    compute_relevance_metrics,
+)
 from model import MultiTaskRoberta
 
 from datasets import DatasetDict
@@ -42,11 +49,11 @@ class DatasetConfig:
 
 ALLSIDES_BASE_MEDIA_SPLIT = "upasanachatterjee/AllSides-media-split"
 ALLSIDES_BASE_RANDOM_SPLIT = "upasanachatterjee/AllSides-random-split"
-_BATCH_SIZE = 64
+_BATCH_SIZE = 32
 _GRAD_ACCUMULATION = 4
 _EFFECTIVE_BATCH_SIZE = _BATCH_SIZE * _GRAD_ACCUMULATION
 _NUM_WORKERS = 8
-_EVAL_BATCH_SIZE = 64
+_EVAL_BATCH_SIZE = 32
 _MAX_LENGTH = 512
 _NUM_PROC = 24
 
@@ -160,6 +167,7 @@ def make_training_args(
     learning_rate: float = 1e-5,
     batch_size_override: Optional[int] = None,
     seed: int = 42,
+    metric_for_best_model: str = "eval_f1_macro",
 ) -> TrainingArguments:
     """Shared HF TrainingArguments for every finetuning run in this study, with
     accumulation derived so any batch size gives the same effective batch.
@@ -179,7 +187,7 @@ def make_training_args(
         gradient_accumulation_steps=max(1, _EFFECTIVE_BATCH_SIZE // batch_size),
         dataloader_num_workers=_NUM_WORKERS,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_f1_macro",
+        metric_for_best_model=metric_for_best_model,
         weight_decay=0.01,
         adam_beta1=0.9,
         adam_beta2=0.999,
@@ -229,6 +237,7 @@ def make_trainer(
     eval_ds,
     compute_fn,
     patience: int = 5,
+    trainer_cls=CustomTrainer,
 ) -> Trainer:
     print("patience=", patience)
     print("compute_fn=", compute_fn)
@@ -238,7 +247,7 @@ def make_trainer(
         WholeEpochCounter(),
     ]
 
-    return CustomTrainer(
+    return trainer_cls(
         model=model,
         args=training_args,
         train_dataset=train_ds,
@@ -248,13 +257,29 @@ def make_trainer(
     )
 
 
-def evaluate_and_cleanup(trainer: Trainer, test_ds):
+def evaluate_and_cleanup(trainer: Trainer, test_ds, predict_fn=batched_predict_metrics_trainer):
     """Score the held-out split, then free the GPU before the next run."""
-    test_metrics = batched_predict_metrics_trainer(
-        trainer, test_ds, batch_size=_EVAL_BATCH_SIZE
-    )
+    test_metrics = predict_fn(trainer, test_ds, batch_size=_EVAL_BATCH_SIZE)
     cleanup()
     return test_metrics
+
+
+def save_finetuned(trainer: Trainer, save_name: str) -> str:
+    """Write the best epoch's weights somewhere `models.load_model` can read back, returning
+    the path.
+    """
+    # MultiTaskRoberta is not a PreTrainedModel, so trainer.save_model writes a bare state
+    # dict that no loader can rebuild the heads from; save_checkpoint carries their sizes.
+    model = trainer.accelerator.unwrap_model(trainer.model)
+    if isinstance(model, MultiTaskRoberta):
+        os.makedirs(save_name, exist_ok=True)
+        path = f"{save_name}/finetuned_model.pt"
+        model.save_checkpoint(path)
+    else:
+        path = f"{save_name}/finetuned_model"
+        trainer.save_model(path)
+    print(f"saved fine-tuned model to {path}")
+    return path
 
 
 def train_model(
@@ -264,6 +289,10 @@ def train_model(
     val_ds,
     save_name: str,
     experiment_config: ExperimentConfig,
+    compute_fn=compute_metrics,
+    predict_fn=batched_predict_metrics_trainer,
+    trainer_cls=CustomTrainer,
+    metric_for_best_model: str = "eval_f1_macro",
 ) -> dict:
     """Fine-tune on train, early-stop on validation, score on test. Returns the test
     metrics with the training arguments attached; validation only selects the model.
@@ -272,6 +301,7 @@ def train_model(
         num_epochs=experiment_config.num_epochs,
         seed=experiment_config.seed,
         batch_size_override=experiment_config.batch_size,
+        metric_for_best_model=metric_for_best_model,
     )
     print("per_device_train_batch_size=", training_args.per_device_train_batch_size)
     print("gradient_accumulation_steps=", training_args.gradient_accumulation_steps)
@@ -281,18 +311,129 @@ def train_model(
         training_args,
         train_ds,
         val_ds,
-        compute_metrics,
+        compute_fn,
         experiment_config.patience,
+        trainer_cls,
     )
 
     trainer.train()
-    if experiment_config.save_model:
-        trainer.save_model(f"{save_name}/finetuned_model")
+    # load_best_model_at_end has already restored the best epoch, so this saves that one.
+    saved_path = save_finetuned(trainer, save_name) if experiment_config.save_model else None
     cleanup()
 
-    test_metrics = evaluate_and_cleanup(trainer, test_ds)
+    test_metrics = evaluate_and_cleanup(trainer, test_ds, predict_fn)
     # test_metrics["log_history"] = trainer.state.log_history
     test_metrics["training_args"] = training_args_to_dict(
         training_args, experiment_config.patience
     )
+    if saved_path is not None:
+        test_metrics["saved_model_path"] = saved_path
     return test_metrics
+
+
+def _task_plumbing(task: str) -> dict:
+    """The scorer, predictor, trainer class and selection metric one MITweet task needs."""
+    if task == "relevance":
+        return {
+            "compute_fn": compute_relevance_metrics,
+            "predict_fn": batched_predict_relevance,
+            "trainer_cls": RelevanceTrainer,
+            # MITweet picks the best relevance epoch on the flattened binary F1.
+            "metric_for_best_model": "eval_f1_micro",
+        }
+    return {
+        "compute_fn": compute_metrics,
+        "predict_fn": batched_predict_ideology,
+        "trainer_cls": CustomTrainer,
+        "metric_for_best_model": "eval_f1_macro",
+    }
+
+
+def run_mitweet_experiment(
+    model,
+    loc: str,
+    mitweet_config: Optional[MITweetConfig] = None,
+    experiment_config: Optional[ExperimentConfig] = None,
+    model_name: Optional[str] = None,
+) -> dict:
+    """Fine-tune one hub name or checkpoint path on one MITweet variant, writing its test
+    metrics into `loc` and returning them.
+    """
+    if mitweet_config is None:
+        mitweet_config = MITweetConfig()
+    if experiment_config is None:
+        experiment_config = ExperimentConfig()
+
+    set_seed(experiment_config.seed)
+    model_name = model_name or get_model_name(model)
+    cleanup()
+    os.makedirs(loc, exist_ok=True)
+
+    tokenizer, model = load_model(model, task=mitweet_config.task)
+    splits = load_mitweet(mitweet_config, tokenizer, isinstance(model, MultiTaskRoberta))
+
+    name = make_experiment_name(model_name)
+    print(f"Training {name} on {variant_name(mitweet_config)}")
+    metrics_test = train_model(
+        model,
+        splits["train"],
+        splits["test"],
+        splits["validation"],
+        f"{loc}/{name}",
+        experiment_config,
+        **_task_plumbing(mitweet_config.task),
+    )
+
+    add_row_counts(metrics_test, dict(splits))
+    with open(f"{loc}/{name}_test_metrics.json", "w") as f:
+        json.dump(metrics_test, f, indent=2)
+    return metrics_test
+
+
+def run_prediction_only(
+    model,
+    loc: str,
+    mitweet_config: Optional[MITweetConfig] = None,
+    model_name: Optional[str] = None,
+    seed: int = 42,
+) -> dict:
+    """Score a checkpoint on one MITweet test split without training it -- the zero-shot arm
+    of the AllSides-to-MITweet comparison.
+    """
+    if mitweet_config is None:
+        mitweet_config = MITweetConfig()
+
+    set_seed(seed)
+    model_name = model_name or get_model_name(model)
+    cleanup()
+    os.makedirs(loc, exist_ok=True)
+
+    tokenizer, model = load_model(model, task=mitweet_config.task)
+    splits = load_mitweet(mitweet_config, tokenizer, isinstance(model, MultiTaskRoberta))
+    plumbing = _task_plumbing(mitweet_config.task)
+
+    training_args = make_training_args(
+        num_epochs=1,
+        seed=seed,
+        batch_size_override=_EVAL_BATCH_SIZE,
+        metric_for_best_model=plumbing["metric_for_best_model"],
+    )
+    # Nothing is trained here, so there is no best epoch to restore.
+    training_args.load_best_model_at_end = False
+    trainer = plumbing["trainer_cls"](
+        model=model, args=training_args, compute_metrics=plumbing["compute_fn"]
+    )
+
+    name = make_experiment_name(model_name)
+    print(f"Predicting {name} on {variant_name(mitweet_config)}, zero-shot")
+    metrics_test = plumbing["predict_fn"](
+        trainer, splits["test"], batch_size=_EVAL_BATCH_SIZE
+    )
+
+    add_row_counts(metrics_test, {"test": splits["test"]})
+    # Named so the JSON says it was never trained, rather than carrying a training config.
+    metrics_test["training_args"] = {"zero_shot": True, "seed": seed}
+    with open(f"{loc}/{name}_test_metrics.json", "w") as f:
+        json.dump(metrics_test, f, indent=2)
+    cleanup()
+    return metrics_test
