@@ -82,15 +82,17 @@ BIAS_CLASSES = (0, 1, 2)
 _CORNER = "true\\pred"
 
 
-def format_confusion_matrix(labels: np.ndarray, predictions: np.ndarray) -> str:
+def format_confusion_matrix(
+    labels: np.ndarray, predictions: np.ndarray, classes=BIAS_CLASSES
+) -> str:
     """The confusion matrix as printable text, rows = true, columns = predicted."""
-    matrix = confusion_matrix(labels, predictions, labels=BIAS_CLASSES)
-    cell = max(len(_CORNER), *(len(str(name)) for name in BIAS_CLASSES)) + 2
+    matrix = confusion_matrix(labels, predictions, labels=classes)
+    cell = max(len(_CORNER), *(len(str(name)) for name in classes)) + 2
     header = f"{_CORNER:>{cell}}" + "".join(
-        f"{name:>{cell}}" for name in BIAS_CLASSES
+        f"{name:>{cell}}" for name in classes
     )
     rows = [
-        f"{BIAS_CLASSES[index]:>{cell}}"
+        f"{classes[index]:>{cell}}"
         + "".join(f"{count:>{cell}d}" for count in row)
         for index, row in enumerate(matrix)
     ]
@@ -220,3 +222,30 @@ def batched_predict_metrics_trainer(
     metrics["ids"] = ids
 
     return metrics
+
+
+def _predict_chunks(trainer: Trainer, dataset: Dataset, batch_size: int, extra_column=None):
+    """Predict over the dataset in slices, returning (logits, labels, ids, extra)."""
+    # Sliced only to bound peak memory, as in `metrics.batched_predict_metrics_trainer`.
+    chunk_compute_metrics, trainer.compute_metrics = trainer.compute_metrics, None
+
+    all_logits, all_labels, all_ids, all_extra = [], [], [], []
+    for start in range(0, len(dataset), batch_size):
+        chunk = dataset.select(range(start, min(start + batch_size, len(dataset))))
+        output = trainer.predict(chunk)
+        logits = output.predictions
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        all_logits.append(np.asarray(logits))
+        all_labels.append(np.asarray(output.label_ids))
+        all_ids.extend(chunk["ID"])
+        if extra_column is not None:
+            all_extra.extend(chunk[extra_column])
+
+    trainer.compute_metrics = chunk_compute_metrics
+    return (
+        np.concatenate(all_logits, axis=0),
+        np.concatenate(all_labels, axis=0),
+        list(all_ids),
+        all_extra,
+    )

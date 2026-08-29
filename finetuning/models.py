@@ -17,19 +17,27 @@ HUB_BASELINES = (BERT, BART, ROBERTA, POLITICS)
 NUM_BIAS_CLASSES = 3
 # MITweet's relevance task is one binary label per facet.
 NUM_RELEVANCE_FACETS = 12
+# Both BASIL tasks ask whether a sentence carries a bias span of one type.
+NUM_BASIL_CLASSES = 2
 # Pretraining always used the full top_themes.txt label space.
 NUM_THEMES = 2000
 
-# MITweet ideology is 0=left/1=center/2=right, exactly the bias labels, so it reuses that head.
-BIAS_TASKS = ("bias", "ideology")
+# Every 3-class fine-tuning task reuses the bias head: MITweet ideology is 0=left/1=center/
+# 2=right, and SemEval stance and opinion are 3 exclusive classes over the same 768->3 shape.
+BIAS_TASKS = ("bias", "ideology", "stance", "opinion")
+# BASIL's two tasks ride the same keys, but the head is 2-wide rather than 3.
+BASIL_TASKS = ("lexical", "informational")
 
 
 def load_model(model_ref: str, task: str = "bias"):
     """Load a hub name, a MultiTaskRoberta `.pt`, or a legacy `pytorch_model.bin`
     directory, with the head `task` needs. Checkpoints always get roberta-base's tokenizer.
     """
-    if task not in BIAS_TASKS and task != "relevance":
-        raise ValueError(f"unknown task {task!r}; expected one of {BIAS_TASKS + ('relevance',)}")
+    if task not in BIAS_TASKS + BASIL_TASKS and task != "relevance":
+        raise ValueError(
+            f"unknown task {task!r}; expected one of "
+            f"{BIAS_TASKS + BASIL_TASKS + ('relevance',)}"
+        )
 
     if model_ref in HUB_BASELINES:
         tokenizer = AutoTokenizer.from_pretrained(model_ref)
@@ -41,7 +49,7 @@ def load_model(model_ref: str, task: str = "bias"):
             )
         else:
             model = AutoModelForSequenceClassification.from_pretrained(
-                model_ref, num_labels=NUM_BIAS_CLASSES
+                model_ref, num_labels=_num_classes(task)
             )
         return tokenizer, model
 
@@ -51,11 +59,18 @@ def load_model(model_ref: str, task: str = "bias"):
     return _load_multitask_checkpoint(model_ref, task)
 
 
+def _num_classes(task: str) -> int:
+    """The classification head's width for one task."""
+    if task == "relevance":
+        return NUM_RELEVANCE_FACETS
+    return NUM_BASIL_CLASSES if task in BASIL_TASKS else NUM_BIAS_CLASSES
+
+
 def _head_sizes(task: str) -> dict:
     """The `MultiTaskRoberta` head arguments one task needs; the other head stays absent."""
     if task == "relevance":
         return {"num_relevance_facets": NUM_RELEVANCE_FACETS}
-    return {"num_bias_classes": NUM_BIAS_CLASSES}
+    return {"num_bias_classes": _num_classes(task)}
 
 
 def _load_multitask_checkpoint(path: str, task: str = "bias"):
@@ -81,6 +96,18 @@ def _load_multitask_checkpoint(path: str, task: str = "bias"):
         num_themes=NUM_THEMES,
         **_head_sizes(task),
     )
+    # strict=False forgives missing and unexpected keys but still raises on a size mismatch,
+    # which a 3-class fine-tuned bias head would hit against BASIL's 2-class one.
+    expected = model.state_dict()
+    mismatched = [
+        key for key, value in state.items()
+        if key in expected and value.shape != expected[key].shape
+    ]
+    for key in mismatched:
+        del state[key]
+    if mismatched:
+        print(f"  dropped {len(mismatched)} head tensors sized for another task: {mismatched}")
+
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"  {len(missing)} missing / {len(unexpected)} unexpected keys")
 
@@ -102,9 +129,7 @@ def _load_legacy_directory(path: str, task: str = "bias"):
             "classifier. Loading it here would silently discard every weight. Save the run "
             "with MultiTaskRoberta.save_checkpoint and pass the resulting .pt file instead."
         )
-    num_labels = (
-        NUM_RELEVANCE_FACETS if task == "relevance" else NUM_BIAS_CLASSES
-    )
+    num_labels = _num_classes(task)
     config = AutoConfig.from_pretrained("roberta-base", num_labels=num_labels)
     if task == "relevance":
         config.problem_type = "multi_label_classification"

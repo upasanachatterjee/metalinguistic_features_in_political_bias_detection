@@ -14,6 +14,7 @@ from transformers import Trainer
 from .metrics import (
     CustomTrainer,
     _compute_classification_metrics,
+    _predict_chunks,
     _unpack,
     format_confusion_matrix,
 )
@@ -127,33 +128,6 @@ def _facet_scores(predictions: np.ndarray, labels: np.ndarray, facets: np.ndarra
         **per_facet_f1,
         **per_facet_accuracy,
     }
-
-
-def _predict_chunks(trainer: Trainer, dataset: Dataset, batch_size: int, extra_column=None):
-    """Predict over the dataset in slices, returning (logits, labels, ids, extra)."""
-    # Sliced only to bound peak memory, as in `metrics.batched_predict_metrics_trainer`.
-    chunk_compute_metrics, trainer.compute_metrics = trainer.compute_metrics, None
-
-    all_logits, all_labels, all_ids, all_extra = [], [], [], []
-    for start in range(0, len(dataset), batch_size):
-        chunk = dataset.select(range(start, min(start + batch_size, len(dataset))))
-        output = trainer.predict(chunk)
-        logits = output.predictions
-        if isinstance(logits, tuple):
-            logits = logits[0]
-        all_logits.append(np.asarray(logits))
-        all_labels.append(np.asarray(output.label_ids))
-        all_ids.extend(chunk["ID"])
-        if extra_column is not None:
-            all_extra.extend(chunk[extra_column])
-
-    trainer.compute_metrics = chunk_compute_metrics
-    return (
-        np.concatenate(all_logits, axis=0),
-        np.concatenate(all_labels, axis=0),
-        list(all_ids),
-        all_extra,
-    )
 
 
 def batched_predict_relevance(

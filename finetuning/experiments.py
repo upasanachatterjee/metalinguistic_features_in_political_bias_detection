@@ -13,12 +13,23 @@ from .metrics import (
     CustomTrainer,
     WholeEpochCounter,
 )
+from .basil import BASIL_CLASS_WEIGHTS, BasilConfig, load_basil
+from .basil import variant_name as basil_variant_name
 from .mitweet import MITweetConfig, load_mitweet, variant_name
+from .semeval import SemEvalConfig, load_semeval
+from .semeval import variant_name as semeval_variant_name
+from .basil_metrics import BasilTrainer, batched_predict_basil, compute_basil_metrics
 from .mitweet_metrics import (
     RelevanceTrainer,
     batched_predict_ideology,
     batched_predict_relevance,
     compute_relevance_metrics,
+)
+from .semeval_metrics import (
+    batched_predict_opinion,
+    batched_predict_stance,
+    compute_opinion_metrics,
+    compute_stance_metrics,
 )
 from model import MultiTaskRoberta
 
@@ -31,6 +42,7 @@ from transformers import (
 )
 from typing import Optional
 from dataclasses import dataclass
+from functools import partial
 
 
 @dataclass
@@ -436,4 +448,116 @@ def run_prediction_only(
     with open(f"{loc}/{name}_test_metrics.json", "w") as f:
         json.dump(metrics_test, f, indent=2)
     cleanup()
+    return metrics_test
+
+
+def _semeval_plumbing(task: str) -> dict:
+    """The scorer, predictor and selection metric one SemEval task needs."""
+    if task == "stance":
+        return {
+            "compute_fn": compute_stance_metrics,
+            "predict_fn": batched_predict_stance,
+            # The shared task's own metric, so the best epoch is the one it would have ranked.
+            "metric_for_best_model": "eval_f1_favor_against",
+        }
+    return {
+        "compute_fn": compute_opinion_metrics,
+        "predict_fn": batched_predict_opinion,
+        "metric_for_best_model": "eval_f1_macro",
+    }
+
+
+def run_semeval_experiment(
+    model,
+    loc: str,
+    semeval_config: Optional[SemEvalConfig] = None,
+    experiment_config: Optional[ExperimentConfig] = None,
+    model_name: Optional[str] = None,
+) -> dict:
+    """Fine-tune one hub name or checkpoint path on one SemEval-2016 Task 6 variant, writing
+    its test metrics into `loc` and returning them.
+    """
+    if semeval_config is None:
+        semeval_config = SemEvalConfig()
+    if experiment_config is None:
+        experiment_config = ExperimentConfig()
+
+    set_seed(experiment_config.seed)
+    model_name = model_name or get_model_name(model)
+    cleanup()
+    os.makedirs(loc, exist_ok=True)
+
+    tokenizer, model = load_model(model, task=semeval_config.task)
+    splits = load_semeval(semeval_config, tokenizer, isinstance(model, MultiTaskRoberta))
+
+    name = make_experiment_name(model_name)
+    print(f"Training {name} on {semeval_variant_name(semeval_config)}")
+    metrics_test = train_model(
+        model,
+        splits["train"],
+        splits["test"],
+        splits["validation"],
+        f"{loc}/{name}",
+        experiment_config,
+        **_semeval_plumbing(semeval_config.task),
+    )
+
+    add_row_counts(metrics_test, dict(splits))
+    with open(f"{loc}/{name}_test_metrics.json", "w") as f:
+        json.dump(metrics_test, f, indent=2)
+    return metrics_test
+
+
+def _basil_plumbing(task: str) -> dict:
+    """The scorer, predictor, trainer class and selection metric one BASIL task needs."""
+    return {
+        "compute_fn": compute_basil_metrics,
+        "predict_fn": batched_predict_basil,
+        # partial, not a subclass per task: `make_trainer` calls trainer_cls with keywords only.
+        "trainer_cls": partial(BasilTrainer, class_weights=BASIL_CLASS_WEIGHTS[task]),
+        # Macro-F1 over a 94%-negative class would select an epoch that predicts nothing.
+        "metric_for_best_model": "eval_f1_positive",
+    }
+
+
+def run_basil_experiment(
+    model,
+    loc: str,
+    basil_config: Optional[BasilConfig] = None,
+    experiment_config: Optional[ExperimentConfig] = None,
+    model_name: Optional[str] = None,
+) -> dict:
+    """Fine-tune one hub name or checkpoint path on one BASIL task and fold, writing its test
+    metrics into `loc` and returning them.
+    """
+    if basil_config is None:
+        basil_config = BasilConfig()
+    if experiment_config is None:
+        experiment_config = ExperimentConfig()
+
+    set_seed(experiment_config.seed)
+    model_name = model_name or get_model_name(model)
+    cleanup()
+    os.makedirs(loc, exist_ok=True)
+
+    tokenizer, model = load_model(model, task=basil_config.task)
+    splits = load_basil(basil_config, tokenizer, isinstance(model, MultiTaskRoberta))
+
+    name = make_experiment_name(model_name)
+    print(f"Training {name} on {basil_variant_name(basil_config)} fold {basil_config.fold}")
+    metrics_test = train_model(
+        model,
+        splits["train"],
+        splits["test"],
+        splits["validation"],
+        f"{loc}/{name}",
+        experiment_config,
+        **_basil_plumbing(basil_config.task),
+    )
+
+    add_row_counts(metrics_test, dict(splits))
+    # Recorded so a metrics JSON identifies its own fold, not just its directory.
+    metrics_test["fold"] = basil_config.fold
+    with open(f"{loc}/{name}_test_metrics.json", "w") as f:
+        json.dump(metrics_test, f, indent=2)
     return metrics_test
