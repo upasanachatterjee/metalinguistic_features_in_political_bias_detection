@@ -13,6 +13,7 @@ import os
 import re
 from dataclasses import dataclass
 from itertools import combinations
+from math import comb
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -24,8 +25,9 @@ from .metrics import _compute_classification_metrics
 # Written by `experiments.run_single`, via `make_experiment_name`.
 METRICS_SUFFIX = "_baseline_trunc_test_metrics.json"
 
-# Everything in the JSON that is not a scalar metric.
-_NON_METRIC_KEYS = ("preds", "labels", "ids", "training_args")
+# Everything in the JSON that is not a scalar metric. `fold` is an int but indexes the data
+# partition, so it would otherwise be summarised as though it were a score.
+_NON_METRIC_KEYS = ("preds", "labels", "ids", "training_args", "fold")
 
 # Per-class keys are excluded: they exist only for classes present in the labels.
 DEFAULT_SUMMARY_METRICS = (
@@ -38,6 +40,7 @@ DEFAULT_SUMMARY_METRICS = (
 )
 
 _SEED_DIR_RE = re.compile(r"seed_(-?\d+)$")
+_FOLD_DIR_RE = re.compile(r"(?:^|/)fold_(\d+)/")
 
 # Labels are ordinal (0=left, 1=center, 2=right), so distance 2 is a polarity flip.
 NUM_BIAS_CLASSES = 3
@@ -46,7 +49,9 @@ POLARITY_FLIP_DISTANCE = 2
 
 @dataclass
 class RunResult:
-    """One metrics JSON: one model, one seed, one test split."""
+    """One metrics JSON: one model, one seed, one test split. `fold` is None for the studies
+    that run a single fixed split.
+    """
 
     model: str
     seed: int
@@ -55,6 +60,7 @@ class RunResult:
     preds: np.ndarray
     labels: np.ndarray
     ids: List[str]
+    fold: Optional[int] = None
 
 
 def load_result(path: str) -> RunResult:
@@ -90,6 +96,12 @@ def load_result(path: str) -> RunResult:
         if key not in _NON_METRIC_KEYS and isinstance(value, (int, float))
     }
 
+    # Written by the runner for the folded studies; otherwise recovered from the path.
+    fold = payload.get("fold")
+    if fold is None:
+        from_path = _FOLD_DIR_RE.search(path)
+        fold = int(from_path.group(1)) if from_path else None
+
     return RunResult(
         model=model,
         seed=int(match.group(1)),
@@ -98,6 +110,7 @@ def load_result(path: str) -> RunResult:
         preds=np.asarray(payload["preds"], dtype=np.int64),
         labels=np.asarray(payload["labels"], dtype=np.int64),
         ids=[str(i) for i in payload["ids"]],
+        fold=fold,
     )
 
 
@@ -108,6 +121,20 @@ def discover_results(root: str) -> List[RunResult]:
     paths = sorted(glob.glob(os.path.join(root, "seed_*", f"*{METRICS_SUFFIX}")))
     results = [load_result(p) for p in paths]
     return sorted(results, key=lambda r: (r.model, r.seed))
+
+
+def discover_folds(root: str) -> List[RunResult]:
+    """Load every metrics JSON under `root/fold_*/seed_*/`, for the studies that run folds."""
+    paths = sorted(glob.glob(os.path.join(root, "fold_*", "seed_*", f"*{METRICS_SUFFIX}")))
+    # `discover_results` on a folded tree returns [] rather than failing, which reads as
+    # "these runs scored nothing" instead of "you pointed at the wrong level".
+    if not paths:
+        raise ValueError(
+            f"no {METRICS_SUFFIX} files under {root}/fold_*/seed_*/. For a single-split study "
+            "use discover_results(root) instead."
+        )
+    results = [load_result(p) for p in paths]
+    return sorted(results, key=lambda r: (r.model, r.fold if r.fold is not None else -1, r.seed))
 
 
 def by_model(results: Sequence[RunResult]) -> Dict[str, List[RunResult]]:
@@ -129,7 +156,8 @@ def coverage(results: Sequence[RunResult]) -> pd.DataFrame:
             "model": model,
             "n_seeds": len(runs),
             "seeds": ", ".join(str(r.seed) for r in runs),
-            "test_rows": runs[0].labels.size,
+            # First axis, not `.size`: relevance labels are one 12-vector per row.
+            "test_rows": len(runs[0].labels),
         }
         for model, runs in sorted(by_model(results).items())
     ]
@@ -202,10 +230,12 @@ def align_by_id(
         raise ValueError("no runs to align")
 
     for run in runs:
-        if run.preds.size != run.labels.size or run.preds.size != len(run.ids):
+        # First axis, not `.size`: MITweet relevance predicts a 12-vector per row, so one id
+        # covers twelve cells and comparing totals would reject every relevance run.
+        if run.preds.shape != run.labels.shape or len(run.preds) != len(run.ids):
             raise ValueError(
                 f"{run.path}: preds/labels/ids lengths disagree "
-                f"({run.preds.size}/{run.labels.size}/{len(run.ids)})"
+                f"({run.preds.shape}/{run.labels.shape}/{len(run.ids)})"
             )
         if len(set(run.ids)) != len(run.ids):
             duplicates = len(run.ids) - len(set(run.ids))
@@ -228,7 +258,8 @@ def align_by_id(
             )
 
     labels = reference.labels
-    preds = np.empty((len(runs), len(ids)), dtype=np.int64)
+    # Trailing axes come from the run itself, so a multi-label (n, 12) run stacks correctly.
+    preds = np.empty((len(runs), *reference.preds.shape), dtype=np.int64)
     for row, run in enumerate(runs):
         order = {example_id: i for i, example_id in enumerate(run.ids)}
         index = np.fromiter((order[i] for i in ids), dtype=np.int64, count=len(ids))
@@ -240,6 +271,216 @@ def align_by_id(
             )
 
     return ids, labels, preds
+
+
+def _f1_per_class(confusion: np.ndarray) -> np.ndarray:
+    """Per-class F1 from a confusion matrix, rows = true, columns = predicted."""
+    true_positive = np.diag(confusion).astype(np.float64)
+    denominator = confusion.sum(axis=0) + confusion.sum(axis=1)
+    # A class with no true and no predicted rows scores 0, as sklearn's zero_division=0 does.
+    return np.divide(
+        2 * true_positive, denominator, out=np.zeros_like(true_positive), where=denominator > 0
+    )
+
+
+def _f1_macro(labels: np.ndarray, preds: np.ndarray, num_classes: int) -> float:
+    scores = _f1_per_class(_confusion(labels, preds, num_classes))
+    # sklearn's macro averages over the classes present in either labels or predictions.
+    present = np.union1d(np.unique(labels), np.unique(preds))
+    return float(scores[present].mean())
+
+
+def _f1_positive(labels: np.ndarray, preds: np.ndarray, num_classes: int) -> float:
+    """BASIL's reported metric: F1 of the biased class alone."""
+    return float(_f1_per_class(_confusion(labels, preds, num_classes))[1])
+
+
+def _f1_favor_against(labels: np.ndarray, preds: np.ndarray, num_classes: int) -> float:
+    """SemEval's own metric: the mean of the FAVOR and AGAINST F1s, ignoring NONE."""
+    scores = _f1_per_class(_confusion(labels, preds, num_classes))
+    return float(scores[[0, 2]].mean())
+
+
+def _f1_micro_multilabel(labels: np.ndarray, preds: np.ndarray, num_classes: int) -> float:
+    """MITweet relevance: every facet cell flattened into one binary vector.
+
+    Positive-class F1, matching `mitweet_metrics`'s own `f1_micro`, which calls `f1_score`
+    with no `average`. sklearn's `average="micro"` on binary input is accuracy, not this.
+    """
+    true_positive = float(np.sum((labels == 1) & (preds == 1)))
+    denominator = float(np.sum(labels == 1) + np.sum(preds == 1))
+    return 2 * true_positive / denominator if denominator else 0.0
+
+
+# Each study is compared on the metric it reports, not on a lowest common denominator.
+PAIRED_METRICS = {
+    "f1_macro": _f1_macro,
+    "f1_positive": _f1_positive,
+    "f1_favor_against": _f1_favor_against,
+    "f1_micro": _f1_micro_multilabel,
+}
+
+
+def pooled_out_of_fold(runs: Sequence[RunResult], metric: str = "f1_macro") -> Dict[str, Any]:
+    """Score one metric over every fold's predictions at once, each row predicted exactly once.
+
+    The right read-out when a fold's own test set is not representative -- an AllSides media
+    fold holds out whole outlets, so its test rows are nearly single-class and a per-fold macro
+    F1 says little. Requires the folds to be a true partition; raises on overlapping ids, which
+    is what a repeated-random-split study like BASIL produces.
+    """
+    if not runs:
+        raise ValueError("no runs to pool")
+    scorer = PAIRED_METRICS[metric]
+
+    seen: Dict[str, int] = {}
+    for run in runs:
+        for example_id in run.ids:
+            if example_id in seen:
+                raise ValueError(
+                    f"id {example_id!r} appears in more than one fold, so these runs are not a "
+                    "partition and pooling would score some rows twice. Use the mean over folds."
+                )
+            seen[example_id] = 1
+
+    preds = np.concatenate([run.preds for run in runs], axis=0)
+    labels = np.concatenate([run.labels for run in runs], axis=0)
+    num_classes = int(max(labels.max(), preds.max())) + 1
+    return {
+        "metric": metric,
+        "score": round(float(scorer(labels, preds, num_classes)) * 100, 2),
+        "n_examples": len(labels),
+        "n_folds": len({run.fold for run in runs}),
+    }
+
+
+def paired_bootstrap(
+    runs_a: Sequence[RunResult],
+    runs_b: Sequence[RunResult],
+    metric: str = "f1_macro",
+    n_boot: int = 2000,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """Bootstrap CI on (model A - model B), joined per example so the pairing is kept.
+
+    Resamples test examples *and* seeds, so the interval covers both the test split and the
+    training noise; with five seeds the latter component is coarse. Returns the mean difference
+    on the JSONs' x100 scale, its 95% percentile interval, and the share of resamples favouring A.
+    """
+    if not runs_a or not runs_b:
+        raise ValueError("both models need at least one run")
+    scorer = PAIRED_METRICS[metric]
+
+    # Aligned together, so `align_by_id` is the one place that checks both models scored the
+    # same examples with the same gold labels.
+    ids, labels, preds = align_by_id(list(runs_a) + list(runs_b))
+    preds_a, preds_b = preds[: len(runs_a)], preds[len(runs_a) :]
+
+    rng = np.random.default_rng(seed)
+    n = len(ids)
+    num_classes = int(max(labels.max(), preds.max())) + 1
+    diffs = np.empty(n_boot)
+    for step in range(n_boot):
+        rows = rng.integers(0, n, n)
+        truth = labels[rows]
+        # Every seed is scored once on this resample, then a bootstrap sample *of the seeds* is
+        # averaged. That gives the sampling distribution of the multi-seed mean, which is the
+        # claim being made -- not of a single training run, which is far more pessimistic.
+        scores_a = np.array([scorer(truth, p[rows], num_classes) for p in preds_a])
+        scores_b = np.array([scorer(truth, p[rows], num_classes) for p in preds_b])
+        score_a = scores_a[rng.integers(0, len(runs_a), len(runs_a))].mean()
+        score_b = scores_b[rng.integers(0, len(runs_b), len(runs_b))].mean()
+        diffs[step] = (score_a - score_b) * 100
+
+    low, high = np.percentile(diffs, [2.5, 97.5])
+    return {
+        "metric": metric,
+        "mean_diff": round(float(diffs.mean()), 2),
+        "ci_low": round(float(low), 2),
+        "ci_high": round(float(high), 2),
+        "share_favouring_a": round(float((diffs > 0).mean()), 3),
+        # The interval excluding zero is the claim; anything else is a wash.
+        "distinguishable": bool(low > 0 or high < 0),
+        "n_examples": n,
+        "n_boot": n_boot,
+    }
+
+
+def pairwise_table(
+    results: Sequence[RunResult],
+    reference: str,
+    metric: str = "f1_macro",
+    n_boot: int = 2000,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Every model against one baseline, as `model - reference` with a bootstrap interval.
+
+    This is the comparison to read, not two independent mean (std) columns: both models scored
+    the same examples, and pairing recovers the covariance that a side-by-side table discards.
+    """
+    grouped = by_model(results)
+    if reference not in grouped:
+        raise ValueError(f"no runs for reference model {reference!r}; have {sorted(grouped)}")
+
+    rows = []
+    for model, runs in sorted(grouped.items()):
+        if model == reference:
+            continue
+        outcome = paired_bootstrap(runs, grouped[reference], metric, n_boot, seed)
+        rows.append({"model": model, "vs": reference, **outcome})
+    return pd.DataFrame(rows)
+
+
+def consistency_table(
+    roots: Dict[str, str],
+    reference: str,
+    metrics: Dict[str, str],
+    n_boot: int = 2000,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """`pairwise_table` over several study directories, one row per (study, model).
+
+    `roots` maps a label to a directory holding `seed_*`; `metrics` maps the same label to a
+    `PAIRED_METRICS` key, since each study is scored on its own metric.
+    """
+    frames = []
+    for study, root in roots.items():
+        results = discover_results(root)
+        if not results:
+            print(f"  SKIP {study}: no runs under {root}")
+            continue
+        table = pairwise_table(results, reference, metrics[study], n_boot, seed)
+        frames.append(table.assign(study=study))
+    if not frames:
+        raise ValueError("no runs found under any root")
+    combined = pd.concat(frames, ignore_index=True)
+    return combined[["study", "model", "vs", "metric", "mean_diff", "ci_low", "ci_high",
+                     "distinguishable", "n_examples"]]
+
+
+def sign_test(table: pd.DataFrame) -> pd.DataFrame:
+    """Per model, how many studies it beats the reference on, with an exact binomial p.
+
+    The point of running four corpora: a method that wins on 12 of 13 variants is evidence no
+    single-corpus confidence interval can reach, however tight.
+    """
+    rows = []
+    for model, group in table.groupby("model"):
+        wins = int((group["mean_diff"] > 0).sum())
+        losses = int((group["mean_diff"] < 0).sum())
+        trials = wins + losses
+        # Two-sided exact binomial against p=0.5, ties dropped as the sign test requires.
+        if trials == 0:
+            p_value = None
+        else:
+            extreme = max(wins, losses)
+            tail = sum(comb(trials, k) for k in range(extreme, trials + 1)) / 2 ** trials
+            p_value = round(min(1.0, 2 * tail), 4)
+        rows.append({
+            "model": model, "wins": wins, "losses": losses, "n_studies": trials,
+            "mean_diff": round(float(group["mean_diff"].mean()), 2), "sign_test_p": p_value,
+        })
+    return pd.DataFrame(rows).sort_values("mean_diff", ascending=False).reset_index(drop=True)
 
 
 def _vote_counts(preds: np.ndarray, num_classes: int) -> np.ndarray:
@@ -398,9 +639,10 @@ def _round_or_none(value: Optional[float], digits: int) -> Optional[float]:
 
 def _confusion(labels: np.ndarray, preds: np.ndarray, num_classes: int) -> np.ndarray:
     """Counts of (true, predicted) pairs, shape (num_classes, num_classes)."""
-    matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
-    np.add.at(matrix, (labels, preds), 1)
-    return matrix
+    # One bincount rather than np.add.at: `paired_bootstrap` calls this tens of thousands of
+    # times, where the buffered version is several times slower.
+    flat = labels.astype(np.int64) * num_classes + preds.astype(np.int64)
+    return np.bincount(flat, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
 
 
 def _kind(distance: int, num_classes: int) -> str:

@@ -138,7 +138,7 @@ def run_single(
 
 def _load_dataset_by_config(dataset_config: DatasetConfig) -> DatasetDict:
     """Load one of the two AllSides splits, which already carry bias/text/id."""
-    # Neither ships a validation split; test stands in, and only drives early stopping.
+    # Both ship a 161-row validation split now; the alias is kept for older revisions.
     ds = load_dataset(dataset_config.custom_dataset or ALLSIDES_BASE_MEDIA_SPLIT)
     if not ds.get("validation"):
         ds["validation"] = ds["test"]
@@ -397,6 +397,10 @@ def run_mitweet_experiment(
     )
 
     add_row_counts(metrics_test, dict(splits))
+    # Recorded so a metrics JSON identifies its own fold, not just its directory. The random
+    # split has no folds, so it stays absent there rather than claiming a meaningless 0.
+    if mitweet_config.split == "facet":
+        metrics_test["fold"] = mitweet_config.fold
     with open(f"{loc}/{name}_test_metrics.json", "w") as f:
         json.dump(metrics_test, f, indent=2)
     return metrics_test

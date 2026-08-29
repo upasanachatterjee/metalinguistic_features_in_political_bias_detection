@@ -31,8 +31,13 @@ NUM_FACETS = 12
 UNRELATED = -1
 # MITweet's --indicator_num default.
 INDICATOR_WORDS = 18
+# Four disjoint triples partitioning all 12 facets, each drawing from three different domains
+# so no fold holds out a whole domain. Fold 0 is the original hand-picked triple, so it
+# reproduces the runs already on disk and checks the rotation against them.
+FACET_FOLDS = ((3, 8, 11), (1, 5, 9), (2, 6, 10), (4, 7, 12))
+NUM_FACET_FOLDS = len(FACET_FOLDS)
 # One facet each from Economy, Diplomacy and Society, all with enough test rows to mean something.
-HELD_OUT_FACETS = (3, 8, 11)
+HELD_OUT_FACETS = FACET_FOLDS[0]
 # MITweet's --pos_weight times its --weight_scale of 0.4, clamped at 1.
 RELEVANCE_POS_WEIGHT = (12.0, 6.0, 2.4, 2.4, 1.0, 16.0, 10.0, 1.2, 1.2, 1.2, 1.0, 1.0)
 # An indicator prefix is at most 76 tokens and 99% of tweets are under 86, so nothing truncates.
@@ -52,8 +57,10 @@ class MITweetConfig:
     task: str = "ideology"
     prepend: str = "indicators"
     split: str = "random"
-    # 1-indexed to match the I1..I12 column names; only the facet split reads it.
-    held_out_facets: Tuple[int, ...] = HELD_OUT_FACETS
+    # Rotates the held-out triple; only the facet split reads it.
+    fold: int = 0
+    # 1-indexed to match the I1..I12 column names. None takes the fold's triple instead.
+    held_out_facets: Optional[Tuple[int, ...]] = None
     data_root: str = MITWEET_DATA_ROOT
 
 
@@ -62,6 +69,13 @@ def variant_name(config: MITweetConfig) -> str:
     if config.task == "relevance":
         return "relevance_random"
     return f"{config.task}_{config.prepend}_{config.split}"
+
+
+def held_out_for(config: MITweetConfig) -> Tuple[int, ...]:
+    """The 1-indexed facets this run holds out: an explicit override, else the fold's triple."""
+    if config.held_out_facets is not None:
+        return tuple(config.held_out_facets)
+    return FACET_FOLDS[config.fold]
 
 
 def _validate(config: MITweetConfig) -> None:
@@ -85,7 +99,19 @@ def _validate(config: MITweetConfig) -> None:
             "never receives a gradient, so testing on it would measure its initialisation."
         )
     if config.split == "facet":
-        held_out = set(config.held_out_facets)
+        if config.fold not in range(NUM_FACET_FOLDS):
+            raise ValueError(
+                f"fold must be in range({NUM_FACET_FOLDS}), got {config.fold!r}"
+            )
+        # Otherwise a hand-picked triple would be filed under a fold_N directory naming a
+        # different one, and the fold mean would pool runs that held out different facets.
+        if config.held_out_facets is not None and config.fold != 0:
+            raise ValueError(
+                "set held_out_facets or fold, not both: held_out_facets="
+                f"{config.held_out_facets!r} with fold={config.fold} would be filed under "
+                f"fold_{config.fold}, whose triple is {FACET_FOLDS[config.fold]}"
+            )
+        held_out = set(held_out_for(config))
         if not held_out or not held_out <= set(range(1, NUM_FACETS + 1)):
             raise ValueError(
                 f"held_out_facets must be a non-empty subset of 1..{NUM_FACETS}, got "
@@ -141,7 +167,7 @@ def _facet_indices(config: MITweetConfig, split_name: str) -> Sequence[int]:
     if config.split == "random":
         return range(NUM_FACETS)
     # held_out_facets is 1-indexed, matching the I1..I12 names.
-    held_out = {facet - 1 for facet in config.held_out_facets}
+    held_out = {facet - 1 for facet in held_out_for(config)}
     # Selecting on a held-out facet would leak the test facets into model selection.
     if split_name == "test":
         return sorted(held_out)
