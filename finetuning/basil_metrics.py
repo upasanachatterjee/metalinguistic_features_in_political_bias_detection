@@ -100,7 +100,7 @@ def compute_basil_metrics(eval_pred) -> Dict[str, Any]:
         logits = logits[0]
     predictions = np.argmax(np.asarray(logits), axis=-1)
     labels = np.asarray(labels).astype(np.int64)
-    print(format_confusion_matrix(labels, predictions, BASIL_CLASSES))
+    # print(format_confusion_matrix(labels, predictions, BASIL_CLASSES))
     return _pooled_scores(predictions, labels)
 
 
@@ -114,7 +114,7 @@ def batched_predict_basil(
     predicted = np.argmax(logits, axis=1)
     actual = np.asarray(labels).astype(np.int64)
 
-    print(format_confusion_matrix(actual, predicted, BASIL_CLASSES))
+    # print(format_confusion_matrix(actual, predicted, BASIL_CLASSES))
     if len(set(ids)) != len(ids):
         raise ValueError(
             f"{len(ids) - len(set(ids))} duplicate ids in the BASIL test set. Each row is one "

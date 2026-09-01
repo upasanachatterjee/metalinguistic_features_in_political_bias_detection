@@ -160,7 +160,7 @@ def batched_predict_ideology(
     actual = np.asarray(labels).astype(np.int64)
     facet_index = np.asarray([int(facet) for facet in facets], dtype=np.int64)
 
-    print(format_confusion_matrix(actual, predicted))
+    # print(format_confusion_matrix(actual, predicted))
     if len(set(ids)) != len(ids):
         raise ValueError(
             f"{len(ids) - len(set(ids))} duplicate ids in the ideology test set. Each row is "

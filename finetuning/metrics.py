@@ -164,7 +164,7 @@ def compute_metrics(eval_pred) -> Dict[str, Any]:
         logits = logits[0]
 
     predictions = np.argmax(np.asarray(logits), axis=-1)
-    print(format_confusion_matrix(np.asarray(labels), predictions))
+    # print(format_confusion_matrix(np.asarray(labels), predictions))
     return _compute_classification_metrics(predictions, labels)
 
 
@@ -206,7 +206,7 @@ def batched_predict_metrics_trainer(
     actual = np.concatenate(all_labels, axis=0)
     ids = list(all_ids)
 
-    print(format_confusion_matrix(actual, predicted))
+    # print(format_confusion_matrix(actual, predicted))
 
     if len(set(ids)) != len(ids):
         print(

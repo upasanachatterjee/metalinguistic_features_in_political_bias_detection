@@ -86,7 +86,7 @@ def _compute(eval_pred, stance: bool) -> Dict[str, Any]:
         logits = logits[0]
     predictions = np.argmax(np.asarray(logits), axis=-1)
     labels = np.asarray(labels).astype(np.int64)
-    print(format_confusion_matrix(labels, predictions))
+    # print(format_confusion_matrix(labels, predictions))
     return _pooled_scores(predictions, labels, stance)
 
 
@@ -115,7 +115,7 @@ def _batched_predict(
     actual = np.asarray(labels).astype(np.int64)
     target_index = np.asarray([int(target) for target in targets], dtype=np.int64)
 
-    print(format_confusion_matrix(actual, predicted))
+    # print(format_confusion_matrix(actual, predicted))
     if len(set(ids)) != len(ids):
         raise ValueError(
             f"{len(ids) - len(set(ids))} duplicate ids in the SemEval test set. Each row is "

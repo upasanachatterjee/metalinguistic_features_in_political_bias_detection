@@ -70,9 +70,9 @@ _MAX_LENGTH = 512
 _NUM_PROC = 24
 
 
-def cleanup():
-    if os.path.isdir("test_trainer"):
-        shutil.rmtree("test_trainer")
+def cleanup(dir):
+    if os.path.isdir(dir):
+        shutil.rmtree(dir)
     gc.collect()
     with torch.no_grad():
         torch.cuda.empty_cache()
@@ -114,6 +114,7 @@ def run_single(
     ds: DatasetDict,
     loc: str,
     experiment_config: Optional[ExperimentConfig] = None,
+    output_dir: str = "test_trainer"
 ):
     """Run a single experiment with given configurations."""
     if experiment_config is None:
@@ -124,7 +125,7 @@ def run_single(
     name = make_experiment_name(model_name)
     print(f"Training {name}")
     metrics_test = train_model(
-        model, train, test, validation, f"{loc}/{name}", experiment_config
+        model, train, test, validation, f"{loc}/{name}", experiment_config, output_dir
     )
 
     add_row_counts(
@@ -151,6 +152,7 @@ def run_experiment(
     dataset_config: Optional[DatasetConfig] = None,
     experiment_config: Optional[ExperimentConfig] = None,
     model_name: Optional[str] = None,
+    output_dir: str = "allsides_test_trainer"
 ) -> dict:
     """Fine-tune one hub name or checkpoint path on one bias dataset, writing its test
     metrics into `loc` and returning them.
@@ -163,14 +165,14 @@ def run_experiment(
 
     set_seed(experiment_config.seed)
     model_name = model_name or get_model_name(model)
-    cleanup()
+    cleanup(output_dir)
 
     if dataset_config.custom_dataset:
         print(f"performing custom dataset action: {dataset_config.custom_dataset}")
     ds = _load_dataset_by_config(dataset_config)
     tokenizer, model = load_model(model)
 
-    return run_single(model_name, model, tokenizer, ds, loc, experiment_config)
+    return run_single(model_name, model, tokenizer, ds, loc, experiment_config, output_dir)
 
 
 def make_training_args(
@@ -269,10 +271,10 @@ def make_trainer(
     )
 
 
-def evaluate_and_cleanup(trainer: Trainer, test_ds, predict_fn=batched_predict_metrics_trainer):
+def evaluate_and_cleanup(trainer: Trainer, test_ds, predict_fn=batched_predict_metrics_trainer, output_dir: str = "test_trainer"):
     """Score the held-out split, then free the GPU before the next run."""
     test_metrics = predict_fn(trainer, test_ds, batch_size=_EVAL_BATCH_SIZE)
-    cleanup()
+    cleanup(output_dir)
     return test_metrics
 
 
@@ -301,6 +303,7 @@ def train_model(
     val_ds,
     save_name: str,
     experiment_config: ExperimentConfig,
+    output_dir: str = "test_trainer",
     compute_fn=compute_metrics,
     predict_fn=batched_predict_metrics_trainer,
     trainer_cls=CustomTrainer,
@@ -310,6 +313,7 @@ def train_model(
     metrics with the training arguments attached; validation only selects the model.
     """
     training_args = make_training_args(
+        output_dir=output_dir,
         num_epochs=experiment_config.num_epochs,
         seed=experiment_config.seed,
         batch_size_override=experiment_config.batch_size,
@@ -331,9 +335,9 @@ def train_model(
     trainer.train()
     # load_best_model_at_end has already restored the best epoch, so this saves that one.
     saved_path = save_finetuned(trainer, save_name) if experiment_config.save_model else None
-    cleanup()
+    cleanup(output_dir)
 
-    test_metrics = evaluate_and_cleanup(trainer, test_ds, predict_fn)
+    test_metrics = evaluate_and_cleanup(trainer, test_ds, predict_fn, output_dir)
     # test_metrics["log_history"] = trainer.state.log_history
     test_metrics["training_args"] = training_args_to_dict(
         training_args, experiment_config.patience
@@ -367,6 +371,7 @@ def run_mitweet_experiment(
     mitweet_config: Optional[MITweetConfig] = None,
     experiment_config: Optional[ExperimentConfig] = None,
     model_name: Optional[str] = None,
+    output_dir: str = "mitweet_test_trainer"
 ) -> dict:
     """Fine-tune one hub name or checkpoint path on one MITweet variant, writing its test
     metrics into `loc` and returning them.
@@ -378,7 +383,7 @@ def run_mitweet_experiment(
 
     set_seed(experiment_config.seed)
     model_name = model_name or get_model_name(model)
-    cleanup()
+    cleanup(output_dir)
     os.makedirs(loc, exist_ok=True)
 
     tokenizer, model = load_model(model, task=mitweet_config.task)
@@ -393,6 +398,7 @@ def run_mitweet_experiment(
         splits["validation"],
         f"{loc}/{name}",
         experiment_config,
+        output_dir,
         **_task_plumbing(mitweet_config.task),
     )
 
@@ -412,6 +418,7 @@ def run_prediction_only(
     mitweet_config: Optional[MITweetConfig] = None,
     model_name: Optional[str] = None,
     seed: int = 42,
+    output_dir: str = "test_trainer"
 ) -> dict:
     """Score a checkpoint on one MITweet test split without training it -- the zero-shot arm
     of the AllSides-to-MITweet comparison.
@@ -421,7 +428,7 @@ def run_prediction_only(
 
     set_seed(seed)
     model_name = model_name or get_model_name(model)
-    cleanup()
+    cleanup(output_dir)
     os.makedirs(loc, exist_ok=True)
 
     tokenizer, model = load_model(model, task=mitweet_config.task)
@@ -429,6 +436,7 @@ def run_prediction_only(
     plumbing = _task_plumbing(mitweet_config.task)
 
     training_args = make_training_args(
+        output_dir=output_dir,
         num_epochs=1,
         seed=seed,
         batch_size_override=_EVAL_BATCH_SIZE,
@@ -451,7 +459,7 @@ def run_prediction_only(
     metrics_test["training_args"] = {"zero_shot": True, "seed": seed}
     with open(f"{loc}/{name}_test_metrics.json", "w") as f:
         json.dump(metrics_test, f, indent=2)
-    cleanup()
+    cleanup(output_dir)
     return metrics_test
 
 
@@ -477,6 +485,7 @@ def run_semeval_experiment(
     semeval_config: Optional[SemEvalConfig] = None,
     experiment_config: Optional[ExperimentConfig] = None,
     model_name: Optional[str] = None,
+    output_dir: str = "semeval_test_trainer"
 ) -> dict:
     """Fine-tune one hub name or checkpoint path on one SemEval-2016 Task 6 variant, writing
     its test metrics into `loc` and returning them.
@@ -488,7 +497,7 @@ def run_semeval_experiment(
 
     set_seed(experiment_config.seed)
     model_name = model_name or get_model_name(model)
-    cleanup()
+    cleanup(output_dir)
     os.makedirs(loc, exist_ok=True)
 
     tokenizer, model = load_model(model, task=semeval_config.task)
@@ -503,6 +512,7 @@ def run_semeval_experiment(
         splits["validation"],
         f"{loc}/{name}",
         experiment_config,
+        output_dir,
         **_semeval_plumbing(semeval_config.task),
     )
 
@@ -530,6 +540,7 @@ def run_basil_experiment(
     basil_config: Optional[BasilConfig] = None,
     experiment_config: Optional[ExperimentConfig] = None,
     model_name: Optional[str] = None,
+    output_dir: str = "basil_test_trainer"
 ) -> dict:
     """Fine-tune one hub name or checkpoint path on one BASIL task and fold, writing its test
     metrics into `loc` and returning them.
@@ -541,7 +552,7 @@ def run_basil_experiment(
 
     set_seed(experiment_config.seed)
     model_name = model_name or get_model_name(model)
-    cleanup()
+    cleanup(output_dir)
     os.makedirs(loc, exist_ok=True)
 
     tokenizer, model = load_model(model, task=basil_config.task)
@@ -556,6 +567,7 @@ def run_basil_experiment(
         splits["validation"],
         f"{loc}/{name}",
         experiment_config,
+        output_dir,
         **_basil_plumbing(basil_config.task),
     )
 
